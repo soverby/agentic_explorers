@@ -176,7 +176,7 @@ git push -u origin add-<short-name>
 gh pr create --repo soverby/agentic_explorers --fill
 ```
 
-Fill in the PR template: what the contribution does, what type it is, and what you tested it with. Put one contribution in each PR.
+Fill in the PR template: a description of the contribution and its type, how to use it, and what you tested it with. Put one contribution in each PR.
 
 ### 6. Respond to review
 

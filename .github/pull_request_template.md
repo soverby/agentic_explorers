@@ -1,17 +1,20 @@
-## What
+# Description
 
-<!-- One line: what this adds. -->
+<!-- What does this add or change, and why? One or two sentences.
+     Type: plugin, skill, agent, doc, training, or vendor-specific. -->
 
-## Type
+# Usage
 
-- [ ] Plugin  - [ ] Skill  - [ ] Agent  - [ ] Doc  - [ ] Training  - [ ] Vendor-specific
+<!-- How does a user install or run it? Give the command or the path,
+     for example: /plugin install <name>, or skills/<name>/. -->
 
-## Tested with
+# Tested with
 
-<!-- Agent + model + version, e.g. Claude Code 2.x / claude-opus-5-5; Codex / gpt-x; pi / ollama qwen3 -->
+<!-- Agent + version + model, for example: Claude Code 2.x / claude-opus-5-5;
+     Codex / gpt-x; pi / ollama qwen3. -->
 
-## Checklist
+# Checklist
 
-- [ ] Followed CONTRIBUTING.md
+- [ ] I followed CONTRIBUTING.md
 - [ ] No secrets, personal data, binaries, or model weights
 - [ ] I license this contribution under MIT
