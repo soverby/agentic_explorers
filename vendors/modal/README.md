@@ -4,7 +4,7 @@
 
 ## Install
 
-Create an account at [modal.com](https://modal.com). Then, on macOS or Linux, with Python:
+Create an account at [modal.com](https://modal.com). Then install with Python 3.10 to 3.14:
 
 ```bash
 pip install modal
@@ -12,6 +12,8 @@ modal setup          # or: python -m modal setup
 ```
 
 `modal setup` authenticates the CLI. [Source](https://modal.com/docs/guide).
+
+Windows: Modal's getting-started guide gives no Windows-specific steps. PyPI lists `modal` as "OS Independent" ([source](https://pypi.org/project/modal/)). Native Windows use of the `modal` CLI is Unverified. If `modal` is not on `PATH`, use `python -m modal` ([source](https://modal.com/docs/guide/troubleshooting)).
 
 ## What goes here
 

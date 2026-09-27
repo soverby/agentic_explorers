@@ -4,13 +4,15 @@
 
 ## Install
 
-macOS or Linux, with npm (Node.js 22.19 or later):
+macOS, Linux, or Windows, with npm (Node.js 22.19 or later):
 
 ```bash
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 ```
 
-The old package `@mariozechner/pi-coding-agent` is deprecated. The official installer is in the [pi README](https://github.com/earendil-works/pi/tree/main/packages/coding-agent). Start pi in your project with `pi`, then run `/login` to connect a provider.
+The old package `@mariozechner/pi-coding-agent` is deprecated. The macOS and Linux installer is in the [quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md). Start pi in your project with `pi`, then run `/login` to connect a provider.
+
+Windows: pi runs natively or inside WSL. Native pi runs its `bash` tool through Git Bash, so install [Git for Windows](https://git-scm.com/download/win), or set `shellPath` in `~/.pi/agent/settings.json`. [Source](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md). The docs write paths as `~/.pi/agent`. The Windows form (`%USERPROFILE%\.pi\agent`) is Unverified.
 
 ## Use this repo's content with pi
 

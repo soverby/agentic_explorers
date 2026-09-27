@@ -13,7 +13,9 @@ Linux:
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-Run `ollama --version` to check the install. [Linux docs](https://docs.ollama.com/linux), [macOS docs](https://docs.ollama.com/macos).
+Windows (10 22H2 or later): download and run `OllamaSetup.exe` from [ollama.com/download/windows](https://ollama.com/download/windows). Ollama runs as a native Windows application. Models and config go in `%HOMEPATH%\.ollama`. Set `OLLAMA_MODELS` to move the models.
+
+Run `ollama --version` to check the install. Docs: [Linux](https://docs.ollama.com/linux), [macOS](https://docs.ollama.com/macos), [Windows](https://docs.ollama.com/windows).
 
 ## Pull and run models
 

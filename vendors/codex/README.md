@@ -4,14 +4,15 @@
 
 ## Install
 
-macOS or Linux, with npm or Homebrew:
+| OS | Command |
+| --- | --- |
+| macOS | `brew install --cask codex` or `npm install -g @openai/codex` |
+| Linux | `npm install -g @openai/codex` |
+| Windows | `npm install -g @openai/codex` (npm ships `win32-x64` and `win32-arm64` builds) |
 
-```bash
-npm install -g @openai/codex
-brew install --cask codex
-```
+Then run `codex` and sign in. Standalone installers for each OS are in the [Codex README](https://github.com/openai/codex).
 
-Then run `codex` and sign in. Other methods are in the [Codex README](https://github.com/openai/codex).
+Windows: the CLI runs natively, with a Windows sandbox. WSL is optional, for Linux-native tooling. [Source](https://learn.chatgpt.com/docs/windows/windows-sandbox). The docs write paths as `~/.codex` and `~/.agents`. The Windows form (`%USERPROFILE%\.codex`, `%USERPROFILE%\.agents`) is Unverified.
 
 ## Use this repo's content with Codex
 

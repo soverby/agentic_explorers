@@ -4,19 +4,16 @@
 
 ## Install
 
-macOS or Linux, with Homebrew:
+| OS | Command |
+| --- | --- |
+| macOS | `brew install --cask claude-code` |
+| Linux | apt, dnf, or apk package: see the [setup guide](https://code.claude.com/docs/en/setup#install-with-linux-package-managers) |
+| Windows | `winget install Anthropic.ClaudeCode` (PowerShell or CMD) |
+| Any, with npm (Node.js 22+) | `npm install -g @anthropic-ai/claude-code` |
 
-```bash
-brew install --cask claude-code
-```
+Windows runs natively, or inside WSL. On native Windows, [Git for Windows](https://git-scm.com/downloads/win) is optional: with it, Claude Code uses Git Bash; without it, PowerShell. Sandboxing needs WSL 2. The native installers are in the [setup guide](https://code.claude.com/docs/en/setup). Run `claude --version` to check the install.
 
-Or with npm (Node.js 22 or later):
-
-```bash
-npm install -g @anthropic-ai/claude-code
-```
-
-The native installer and apt, dnf, and apk packages are in the [setup guide](https://code.claude.com/docs/en/setup). Run `claude --version` to check the install.
+On Windows, `~/.claude` means `%USERPROFILE%\.claude` ([source](https://code.claude.com/docs/en/settings)). So the paths below become `%USERPROFILE%\.claude\skills\<name>\` and `%USERPROFILE%\.claude\agents\`.
 
 ## Use this repo's content with Claude Code
 
@@ -35,10 +32,18 @@ To test a plugin from a local clone for one session: `claude --plugin-dir ./plug
 cp -R skills/<name> ~/.claude/skills/<name>
 ```
 
+```powershell
+Copy-Item -Recurse skills\<name> "$env:USERPROFILE\.claude\skills\<name>"
+```
+
 **Agents.** Claude Code reads subagents from `~/.claude/agents/` (user) and `.claude/agents/` (project). Copy the Claude variant of an agent:
 
 ```bash
 cp agents/<name>/vendors/claude.md ~/.claude/agents/<name>.md
+```
+
+```powershell
+Copy-Item agents\<name>\vendors\claude.md "$env:USERPROFILE\.claude\agents\<name>.md"
 ```
 
 **Claude-only plugins** live in `vendors/claude/plugins/<name>/`. The first one, `usage-review`, comes in a separate PR.
