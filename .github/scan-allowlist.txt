@@ -1,0 +1,27 @@
+# Path allowlist for scripts/ci/scan_content.py.
+#
+# Format: <rule-id> <glob>   (one entry per line; '#' starts a comment)
+# Globs use Python fnmatch against the repo-relative path; '*' also matches '/'.
+# An unknown rule id is a hard error. Prefer a line-level `scan-allow: <rule-id>`
+# comment over an entry here: entries here skip the rule for the whole file.
+# Every change to this file needs maintainer review.
+
+# Root README documents the scanner and quotes an example injection phrase.
+prompt-injection README.md
+
+# Scanner tests and fixtures: fake values that the tests expect each rule to detect.
+# Card, SSN and IBAN values are published test values, not real data.
+phone-number        scripts/ci/tests/*
+us-ssn              scripts/ci/tests/*
+credit-card         scripts/ci/tests/*
+iban                scripts/ci/tests/*
+private-key         scripts/ci/tests/*
+whatsapp-export     scripts/ci/tests/*
+reverse-shell       scripts/ci/tests/*
+pipe-to-shell       scripts/ci/tests/*
+base64-exec         scripts/ci/tests/*
+crypto-miner        scripts/ci/tests/*
+credential-exfil    scripts/ci/tests/*
+email-address       scripts/ci/tests/*
+prompt-injection    scripts/ci/tests/*
+svg-script          scripts/ci/tests/*

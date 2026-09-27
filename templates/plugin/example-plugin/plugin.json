@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "example-plugin",
+  "version": "0.1.0",
+  "description": "One-line description of what this plugin does.",
+  "author": {
+    "name": "Your Name",
+    "url": "https://github.com/your-handle"
+  },
+  "license": "MIT",
+  "keywords": [
+    "example"
+  ],
+  "extensions": {
+    "com.anthropic.claude-code": {}
+  }
+}

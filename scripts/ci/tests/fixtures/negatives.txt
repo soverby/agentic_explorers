@@ -1,0 +1,57 @@
+# One sample per line. None of these may produce any finding.
+version 1.2.3
+v10.20.30-beta.1+build.5
+1.2.3-rc.1
+pip install foo==1.2.3
+2024-01-15
+2024-01-15T10:15:00+05:30
+2024-01-15T10:15:00Z
+2024-01-15 10:15:00.123456
+12:30:45
+10:15:00 PM
+12/31/24
+unix 1705312500 ms 1705312500123 ns 1705312500123456789
+Build 20240115.1
+123e4567-e89b-12d3-a456-426614174000
+3d3c42e5aac5ba805825da76410c181273ba90b1
+commit 3d3c42e
+sha256:551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+0x7fffffffffffffff
+192.168.100.200
+127.0.0.1:8080
+x = 3.14159265358979
+y = +3.14159265358979
+1e+10
++1234
+port 5432
+1,234,567.89
+Copyright (c) 2024-2026
+ISBN 978-3-16-148410-0
+order id 4111111111111112
+1234 5678 9012 3456
+GB00 WEST 1234 5698 7654 32
+[2024-01-15 10:00:00] INFO: started
+curl -fsSL https://example.com/x -o x.sh
+curl https://api.example.com | jq .
+curl https://api.example.com | python3 -m json.tool
+curl … \| sh
+sha256sum -c checksums.txt | sh256check
+ssh -i ~/.ssh/id_ed25519 user@host
+scp -i ~/.ssh/id_rsa file.txt host:/tmp/
+curl -F "key=@$HOME/.ssh/id_rsa.pub" https://example.com/keys
+cat ~/.ssh/id_rsa.pub
+base64 -d file.b64 > out.txt
+echo hi | base64
+git clone git@github.com:soverby/agentic_explorers.git
+Co-Authored-By: Claude <noreply@anthropic.com>
+123+soverby@users.noreply.github.com
+dev@example.com
+icon@2x.png
+npm install @scope/pkg@1.2.3
+family emoji 👨‍👩‍👧 and flag 🏳️‍🌈
+Persian word می‌خواهم
+flag of England 🏴󠁧󠁢󠁥󠁮󠁧󠁿
++10011010010
+211 486 761 1265
+(415) 555 2671
+'gsn gsv gu gv gwmi h history icm iex ihy ii ipal ipcsv ipmo ipsn irm ise iwmi ' +

@@ -1,0 +1,15 @@
+{
+  "name": "example-plugin",
+  "version": "0.1.0",
+  "description": "One-line description of what this plugin does.",
+  "author": {
+    "name": "Your Name"
+  },
+  "license": "MIT",
+  "agents": [
+    "./com.anthropic.claude-code/agents/example-agent.md"
+  ],
+  "commands": "./com.anthropic.claude-code/commands/",
+  "hooks": "./com.anthropic.claude-code/hooks/hooks.json",
+  "mcpServers": "./com.anthropic.claude-code/mcp.json"
+}

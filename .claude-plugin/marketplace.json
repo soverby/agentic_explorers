@@ -1,0 +1,10 @@
+{
+  "name": "agentic-explorers",
+  "owner": {
+    "name": "Agentic Engineering community"
+  },
+  "metadata": {
+    "description": "Community plugins from the Agentic Engineering WhatsApp group."
+  },
+  "plugins": []
+}

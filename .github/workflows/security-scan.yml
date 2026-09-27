@@ -1,0 +1,221 @@
+# Security checks for every PR and every push to main.
+# Each job is a separate required status check: secrets, malware, pii-and-content.
+# See scripts/ci/README.md for rules, overrides, and how to run locally.
+#
+# Uses `pull_request` (never `pull_request_target`): fork PRs run with a
+# read-only token and no secrets, so PR code can not write to the repo.
+
+name: security-scan
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  secrets:
+    name: secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz (from the release checksums file).
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      # Commit of tag v8.30.1 and sha256 of its config/gitleaks.toml (default rules).
+      GITLEAKS_CONFIG_COMMIT: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e
+      GITLEAKS_CONFIG_SHA256: e163e53b9e7e8a8511e77271e2b323ed057759542a6d988258afe3a1fa329caf
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          sums="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -fsSL --retry 3 -o "$tarball" "$url/$tarball"
+          curl -fsSL --retry 3 -o "$sums" "$url/$sums"
+          # 1) pinned hash in this file; 2) the release's own checksums file.
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          grep -F "  ${tarball}" "$sums" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+          ./gitleaks version
+
+      - name: Build gitleaks config (upstream default rules, no global path allowlist)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gitleaks-default.toml" \
+            "https://raw.githubusercontent.com/gitleaks/gitleaks/${GITLEAKS_CONFIG_COMMIT}/config/gitleaks.toml"
+          # Verifies the sha256, then drops the default global [allowlist] paths
+          # (.svg, .pdf, lock files, node_modules, vendor/ ...) so secrets there are reported.
+          python3 scripts/ci/gitleaks_ci.py config \
+            "$RUNNER_TEMP/gitleaks-default.toml" "$GITLEAKS_CONFIG_SHA256" "$RUNNER_TEMP/gitleaks.toml"
+
+      - name: Self-test (planted fake tokens must be reported)
+        run: python3 scripts/ci/gitleaks_ci.py selftest "$RUNNER_TEMP/gitleaks" "$RUNNER_TEMP/gitleaks.toml"
+
+      - name: Scan commits for secrets
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            # Every commit in the PR, so a secret added then deleted is still caught.
+            range="${PR_BASE}..${PR_HEAD}"
+          elif [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            range="${PUSH_AFTER}"   # new branch or rewritten history: all reachable commits
+          else
+            range="${PUSH_BEFORE}..${PUSH_AFTER}"
+          fi
+          echo "gitleaks range: $range"
+          # A PR can not weaken the scan: its .gitleaksignore is deleted first,
+          # repo .gitleaks.toml is ignored (--config), gitleaks:allow is ignored.
+          python3 scripts/ci/gitleaks_ci.py scan "$RUNNER_TEMP/gitleaks" "$RUNNER_TEMP/gitleaks.toml" "$range"
+
+  malware:
+    name: malware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache key (UTC day)
+        id: day
+        run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # Reuse signatures between runs: freshclam then only fetches small diffs,
+      # which avoids most CDN rate limits on shared runner IPs.
+      - name: Restore ClamAV signature cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/clamav-db
+          key: clamav-db-v1-${{ steps.day.outputs.day }}
+          restore-keys: clamav-db-v1-
+
+      - name: Install ClamAV
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends clamav clamav-freshclam
+          # The package starts a freshclam daemon at install. Stop it so it does not
+          # hold the update lock or spend our download quota on /var/lib/clamav.
+          sudo systemctl stop clamav-freshclam.service || true
+          clamscan --version
+
+      - name: Update signatures
+        run: |
+          set -euo pipefail
+          db="$RUNNER_TEMP/clamav-db"
+          mkdir -p "$db"
+          conf="$RUNNER_TEMP/freshclam.conf"
+          printf 'DatabaseDirectory %s\nDatabaseMirror database.clamav.net\n' "$db" > "$conf"
+          ok=0
+          for attempt in 1 2 3; do
+            if freshclam --config-file="$conf" --stdout; then ok=1; break; fi
+            echo "freshclam attempt $attempt failed"
+            sleep $((attempt * 20))
+          done
+          # Do not cache freshclam's cool-down state into later runs.
+          rm -f "$db/freshclam.dat"
+          have_db=1
+          for m in main daily; do
+            if [ ! -s "$db/$m.cvd" ] && [ ! -s "$db/$m.cld" ]; then have_db=0; fi
+          done
+          if [ "$have_db" -ne 1 ]; then
+            echo "::error::No ClamAV signatures available (freshclam failed and no cache). Re-run the job later."
+            exit 1
+          fi
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::freshclam failed (likely CDN rate limit); scanning with cached signatures."
+          fi
+          ls -l "$db"
+
+      - name: Self-test (EICAR test string, in memory only)
+        run: |
+          set -uo pipefail
+          # The EICAR string is assembled at runtime and piped via stdin; it is
+          # never written to disk or committed.
+          python3 - <<'PY' | clamscan --no-summary --database="$RUNNER_TEMP/clamav-db" -
+          import sys
+          parts = ["X5O!P%@AP[4\\PZX54(P^)7CC)7}$", "EICAR-STANDARD-", "ANTIVIRUS-TEST-", "FILE!$H+H*"]
+          sys.stdout.write("".join(parts))
+          PY
+          rc=${PIPESTATUS[1]}
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::ClamAV self-test failed: EICAR not detected (clamscan exit $rc). Signatures did not load."
+            exit 1
+          fi
+          echo "Self-test OK: signatures loaded and detection works."
+
+      # Scan the committed bytes, not the checkout: .gitattributes in a PR could
+      # re-encode files (working-tree-encoding) or hide them from `git archive`.
+      - name: Export committed tree
+        run: python3 scripts/ci/export_tree.py HEAD "$RUNNER_TEMP/tree"
+
+      - name: Scan committed tree
+        run: |
+          set -uo pipefail
+          clamscan --recursive --infected \
+            --database="$RUNNER_TEMP/clamav-db" \
+            --alert-exceeds-max=yes --alert-encrypted=yes \
+            "$RUNNER_TEMP/tree"
+          rc=$?
+          case "$rc" in
+            0) echo "ClamAV: no detections." ;;
+            1) echo "::error::ClamAV detected malware. See the FOUND lines above."; exit 1 ;;
+            *) echo "::error::clamscan error (exit $rc)."; exit 1 ;;
+          esac
+
+  pii-and-content:
+    name: pii-and-content
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scanner unit tests
+        run: python3 -m unittest discover scripts/ci/tests
+
+      # Content is read from git objects (PR head / pushed commit), not the
+      # working tree, so .gitattributes filters and encodings can not alter it.
+      - name: Scan changed files (PR) or all files (push)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            python3 scripts/ci/scan_content.py --base "$PR_BASE" --head "$PR_HEAD"
+          else
+            python3 scripts/ci/scan_content.py --rev "$GITHUB_SHA"
+          fi

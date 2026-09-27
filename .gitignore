@@ -1,0 +1,33 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets — never commit keys, tokens, or .env files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python / Node
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+
+# Model artifacts — share via Hugging Face / Modal volumes / releases, not git
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.onnx
+checkpoints/
+outputs/
+wandb/
+
+# Local agent state
+.claude/settings.local.json
