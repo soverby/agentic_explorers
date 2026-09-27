@@ -163,7 +163,7 @@ jobs:
 
       - name: Self-test (EICAR test string, in memory only)
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # runner shell adds -e; exit codes are checked below
           # The EICAR string is assembled at runtime and piped via stdin; it is
           # never written to disk or committed.
           python3 - <<'PY' | clamscan --no-summary --database="$RUNNER_TEMP/clamav-db" -
@@ -185,7 +185,7 @@ jobs:
 
       - name: Scan committed tree
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # runner shell adds -e; exit codes are checked below
           clamscan --recursive --infected \
             --database="$RUNNER_TEMP/clamav-db" \
             --alert-exceeds-max=yes --alert-encrypted=yes \
