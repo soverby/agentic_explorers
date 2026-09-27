@@ -125,6 +125,12 @@ jobs:
           # The package starts a freshclam daemon at install. Stop it so it does not
           # hold the update lock or spend our download quota on /var/lib/clamav.
           sudo systemctl stop clamav-freshclam.service || true
+          # Ubuntu's AppArmor profile lets freshclam read config only from
+          # /etc/clamav and write only to /var/lib/clamav. Unload it so freshclam
+          # can use the config and database directory in $RUNNER_TEMP.
+          if [ -f /etc/apparmor.d/usr.bin.freshclam ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.bin.freshclam || true
+          fi
           clamscan --version
 
       - name: Update signatures
