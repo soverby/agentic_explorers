@@ -1,0 +1,59 @@
+# Unit tests for scripts that plugins ship (standard-library Python only).
+# Runs on every OS and on the oldest and newest supported Python.
+#
+# Uses `pull_request` (never `pull_request_target`): fork PRs run with a
+# read-only token and no secrets.
+
+name: plugin-tests
+
+on:
+  pull_request:
+    paths:
+      - "vendors/**/tests/**"
+      - "vendors/**/scripts/**"
+      - "plugins/**"
+      - ".github/workflows/plugin-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "vendors/**/tests/**"
+      - "vendors/**/scripts/**"
+      - "plugins/**"
+      - ".github/workflows/plugin-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  usage-review:
+    name: usage-review (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Unit tests
+        run: |
+          python --version
+          python -m unittest discover -v vendors/claude/plugins/usage-review/skills/usage-review/scripts/tests
