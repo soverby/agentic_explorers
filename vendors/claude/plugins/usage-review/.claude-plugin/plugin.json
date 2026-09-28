@@ -1,6 +1,6 @@
 {
   "name": "usage-review",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Weekly Claude Code token usage by model and effort from local transcripts, with ranked recommendations to cut tokens or raise quality.",
   "author": {
     "name": "Sean Overby",

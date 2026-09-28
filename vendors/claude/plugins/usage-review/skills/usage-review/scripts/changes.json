@@ -1,0 +1,10 @@
+{
+  "_schema": {
+    "doc": "Template. Put your own file at --changes PATH or <out-root>/changes.json (default ~/Documents/claude-usage/changes.json). Each entry compares the metrics in the 14 days before and after its date.",
+    "date": "YYYY-MM-DD: the day the change took effect (local time)",
+    "description": "short text, for example 'subagent cache TTL set to 1h'",
+    "metrics": "list, any of: sessions, calls, input_uncached, cache_write_5m, cache_write_1h, cache_read, output, cache_hit_pct, write_share_pct, median_peak_context, max_peak_context, median_first_call_context, tokens_per_session, cost_weighted_input_usd, compactions, auto_compactions, limit_hits",
+    "scope": "optional: all (default), main or subagent"
+  },
+  "changes": []
+}
