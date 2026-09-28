@@ -147,6 +147,10 @@ def build_profile_a(root: Path) -> Path:
             content=[
                 tool_use("tu3", "Read", file_path="/work/demo/a.py"),
                 tool_use("tu8", "Bash", command=f"echo {MARKER}"),
+                # Read calls with no file_path: their other input must never be kept
+                tool_use("tu5", "Read", content=MARKER),
+                tool_use("tu6", "Read", content=MARKER),
+                tool_use("tu7", "Read", content=MARKER),
             ],
         ),
         tool_result("2026-09-14T12:02:01Z", "tu3", "y" * 100),

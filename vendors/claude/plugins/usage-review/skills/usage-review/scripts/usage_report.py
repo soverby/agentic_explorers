@@ -7,12 +7,22 @@ Exit codes:
   0  success
   2  input problem: bad arguments or config file, no transcript files,
      no usage in the date range, or schema drift (see SCHEMA_DRIFT_MAX_FRACTION)
-  3  an invariant failed (see check_invariants); no output is written
+  3  an invariant failed (see check_invariants). Invariants 1-3 are checked
+     before any file is written, so nothing is written. If the manifest check
+     (invariant 4) fails, manifest.json is deleted; the other files stay, but
+     without a manifest they are not a valid run.
 
 Outputs (in --out): weekly_by_model_effort.csv, weekly_by_agent.csv,
 diagnostics.json, inventory.json, findings.json, report.md, manifest.json.
-The outputs contain only numbers, ids, tool names, file paths and model names.
-They never contain message text or tool input/output content.
+The script never changes them after the run. The outputs keep numbers, ids,
+tool names, file paths (including working directories of project CLAUDE.md
+files) and model names. They never contain message text, thinking, tool input
+or tool output content.
+
+Deduplication: one API response can be written as several lines. Lines are
+keyed by message.id, else requestId, else file:line. For each key the line
+with the largest output_tokens wins; on a tie, a line from a non-fork agent
+wins, then the earliest timestamp, then the smallest file path and line.
 """
 
 from __future__ import annotations
@@ -31,7 +41,7 @@ import sys
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TOOL = "usage-review"
 
 EXIT_OK = 0
@@ -39,7 +49,7 @@ EXIT_INPUT = 2
 EXIT_INVARIANT = 3
 
 # ---------------------------------------------------------------- thresholds
-SCHEMA_DRIFT_MAX_FRACTION = Decimal("0.05")  # assistant lines without usage/timestamp
+SCHEMA_DRIFT_MAX_FRACTION = Decimal("0.05")  # max share of unusable assistant lines
 MIN_SESSIONS_PER_SIDE = 10  # before/after: smaller samples give "insufficient data"
 BEFORE_AFTER_WINDOW_DAYS = 14  # days on each side of a change date
 CHARS_PER_TOKEN = 4  # approximation for tool results and config files
@@ -56,9 +66,13 @@ CONTEXT_WINDOW_LARGE = (
 NEAR_LIMIT_FRACTION = Decimal("0.8")
 PEAK_CONTEXT_THRESHOLD = 300_000
 START_CONTEXT_THRESHOLD = 30_000
-REVIEWER_ROUNDS_THRESHOLD = 2
+REVIEWER_ROUNDS_THRESHOLD = 2  # reviewer rounds per task
+TASK_LINK_MIN_OVERLAP = Decimal(
+    "0.5"
+)  # description token overlap to link runs to one task
 PEAK_BUCKETS = (200_000, 300_000, 500_000, 800_000)
 TOP_N = 10
+PLAUSIBLE_YEARS = (2000, 2999)  # a timestamp outside these years is treated as invalid
 CONFIDENCE = {"measured": Decimal("1.0"), "inferred": Decimal("0.5")}
 THRESHOLD_NAMES = (
     "SCHEMA_DRIFT_MAX_FRACTION",
@@ -77,10 +91,21 @@ THRESHOLD_NAMES = (
     "PEAK_CONTEXT_THRESHOLD",
     "START_CONTEXT_THRESHOLD",
     "REVIEWER_ROUNDS_THRESHOLD",
+    "TASK_LINK_MIN_OVERLAP",
     "PEAK_BUCKETS",
     "TOP_N",
+    "PLAUSIBLE_YEARS",
 )
-VERDICT_LINES = {"VERDICT: APPROVE": "approve", "VERDICT: CHANGES": "changes"}
+# First matching line of the reviewer's handback message, else of its final text.
+VERDICT_RE = re.compile(r"^[*#\s]*VERDICT:\s*(APPROVE|PASS|CHANGES)\b", re.IGNORECASE)
+VERDICT_MAP = {"approve": "approve", "pass": "approve", "changes": "changes"}
+HANDBACK_TOOL = "SubagentHandback"
+# Words that describe the kind of run or the round, not the task itself.
+TASK_STOPWORDS = frozenset(
+    "a an and the of for to in on with at by build built rebuild validate validation revalidate re review "
+    "rereview reviewer fix fixes write implement verify check final round rounds pass attempt iteration "
+    "again follow up".split()
+)
 
 TOKEN_FIELDS = ("inp", "w5", "w1", "read", "out", "think")
 CSV_TOKEN_COLUMNS = (
@@ -104,17 +129,22 @@ HDR = [
 ]
 HDR_AGENT = ["week", "split", "agent_type", *HDR[3:]]
 
-SETTINGS_KEYS = (
+# inventory: only these keys, and only safe scalar values (never whole objects)
+SETTINGS_SCALAR_KEYS = (
     "model",
     "effortLevel",
-    "modelSettings",
     "alwaysThinkingEnabled",
     "autoCompactWindow",
     "promptCacheTtl",
     "subagentPromptCacheTtl",
     "cleanupPeriodDays",
-    "outputStyle",
 )
+MODEL_SETTINGS_SCALAR_KEYS = (
+    "effortLevel",
+    "alwaysThinkingEnabled",
+    "maxThinkingTokens",
+)
+OUTPUT_STYLES = ("default", "Explanatory", "Learning")
 SETTINGS_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
@@ -128,6 +158,7 @@ SETTINGS_ENV_KEYS = (
     "ENABLE_PROMPT_CACHING_1H",
     "CLAUDE_CODE_EFFORT_LEVEL",
 )
+SAFE_SCALAR_RE = re.compile(r"^[A-Za-z0-9_.:\-\[\]]{1,64}$")
 AGENT_KEYS = ("model", "effort", "tools", "disallowedTools", "omitClaudeMd", "cacheTtl")
 
 METRICS = (
@@ -154,6 +185,7 @@ SCOPES = ("all", "main", "subagent")
 CENT = Decimal("0.01")
 TENTH = Decimal("0.1")
 MILLION = Decimal(1_000_000)
+ZERO = Decimal(0)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -223,6 +255,23 @@ def p90_int(values) -> int | None:
     return int(values[idx])
 
 
+def is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def safe_scalar(v):
+    """A settings value that is safe to copy: bool, int, Decimal or a short token."""
+    if isinstance(v, (bool, int, Decimal)):
+        return v
+    if isinstance(v, str) and SAFE_SCALAR_RE.match(v):
+        return v
+    return None
+
+
+def default_root(home: Path) -> Path:
+    return home / "Documents" / "claude-usage"
+
+
 # -------------------------------------------------------------------- prices
 class Prices:
     def __init__(self, path: Path):
@@ -267,6 +316,18 @@ class Prices:
             / MILLION
         )
         return w_in, Decimal(r["out"]) * out / MILLION
+
+    def cache_read_cost(self, model, tokens) -> Decimal | None:
+        p = self.lookup(model)
+        return None if p is None else Decimal(tokens) * p[0] * p[2] / MILLION
+
+    def cache_write_cost(self, model, w5, w1) -> Decimal | None:
+        p = self.lookup(model)
+        return (
+            None
+            if p is None
+            else (w5 * self.w5_mult + w1 * self.w1_mult) * p[0] / MILLION
+        )
 
 
 # ------------------------------------------------------------------- changes
@@ -342,11 +403,12 @@ def parse_ts(text, tz):
         return None
     try:
         t = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+        t = t.astimezone(tz) if tz is not None else t.astimezone()
+        return t if PLAUSIBLE_YEARS[0] <= t.year <= PLAUSIBLE_YEARS[1] else None
+    except (ValueError, OverflowError, OSError):
         return None
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=dt.timezone.utc)
-    return t.astimezone(tz) if tz is not None else t.astimezone()
 
 
 def content_chars(c) -> int:
@@ -357,37 +419,80 @@ def content_chars(c) -> int:
     return len(json.dumps(c, ensure_ascii=False))
 
 
-def last_text(content) -> str:
+def text_of(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         return "\n".join(
-            b.get("text", "")
+            b["text"]
             for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
+            if isinstance(b, dict)
+            and b.get("type") == "text"
+            and isinstance(b.get("text"), str)
         )
     return ""
 
 
-def verdict_of(text: str) -> str:
-    found = {
-        VERDICT_LINES[ln.strip()]
-        for ln in text.splitlines()
-        if ln.strip() in VERDICT_LINES
-    }
-    return found.pop() if len(found) == 1 else "unclear"
+def verdict_in(text: str | None) -> str | None:
+    for ln in (text or "").splitlines():
+        m = VERDICT_RE.match(ln)
+        if m:
+            return VERDICT_MAP[m.group(1).lower()]
+    return None
+
+
+def verdict_of(handback: str | None, final_text: str | None) -> str:
+    """The handback message first, then the final text; the first VERDICT line wins."""
+    return verdict_in(handback) or verdict_in(final_text) or "unclear"
+
+
+def task_tokens(desc) -> frozenset:
+    if not isinstance(desc, str):
+        return frozenset()
+    return frozenset(
+        t
+        for t in re.findall(r"[a-z0-9]+", desc.lower())
+        if t not in TASK_STOPWORDS and not t.isdigit()
+    )
+
+
+def overlap(a: frozenset, b: frozenset) -> Decimal:
+    if not a or not b:
+        return ZERO
+    return Decimal(len(a & b)) / min(len(a), len(b))
+
+
+def better(new: dict, old: dict) -> bool:
+    """Dedup tie-break: larger output, then non-fork agent, then earlier time, then path/line."""
+    if new["out"] != old["out"]:
+        return new["out"] > old["out"]
+    nf, of = new["agent"] == "fork", old["agent"] == "fork"
+    if nf != of:
+        return of
+    if new["ts"] != old["ts"]:
+        return new["ts"] < old["ts"]
+    return (new["src"], new["line"]) < (old["src"], old["line"])
+
+
+class FileStats:
+    def __init__(self):
+        self.in_range_lines = 0  # lines with a timestamp in the range
+        self.undated_lines = 0  # lines without a usable timestamp
+        self.out_of_range_lines = 0
+        self.assistant_in_range = 0
+        self.assistant_undated = 0
+        self.drift = collections.Counter()
+        self.skipped = collections.Counter()
+        self.missing = collections.Counter()
 
 
 class Scan:
     """Everything read from the transcripts. Holds no message text."""
 
     def __init__(self):
-        self.files = collections.Counter()  # profile -> files
-        self.lines = 0
-        self.assistant_lines = 0
-        self.drift = collections.Counter()  # assistant lines lacking usage / timestamp
-        self.skipped = collections.Counter()
-        self.missing = collections.Counter()
+        self.files_found = collections.Counter()  # profile -> files
+        self.file_stats: dict[tuple[str, str], FileStats] = {}
+        self.unreadable = 0
         self.calls: dict[str, dict] = {}
         self.raw: list[dict] = []  # every usage line (for reconciliation)
         self.compacts: dict[str, dict] = {}
@@ -395,160 +500,247 @@ class Scan:
         self.tool_uses: dict[str, dict] = {}
         self.tool_results: dict[str, dict] = {}
         self.reviewer_final: dict[str, str] = {}  # run id -> verdict
+        self.run_task: dict[
+            str, frozenset
+        ] = {}  # run id -> task tokens (never written out)
         self.cwds = collections.Counter()
 
+    def in_range_files(self):
+        # files with an in-range line, and files with no dated line at all (they fit no range)
+        return {
+            k: v
+            for k, v in self.file_stats.items()
+            if v.in_range_lines or (v.undated_lines and not v.out_of_range_lines)
+        }
 
-def scan(profiles, tz) -> Scan:
+    def totals(self) -> dict:
+        fs = self.in_range_files()
+        skipped, missing, drift = (
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
+        )
+        for v in fs.values():
+            skipped.update(v.skipped)
+            missing.update(v.missing)
+            drift.update(v.drift)
+        if self.unreadable:
+            skipped["unreadable file"] += self.unreadable
+        return dict(
+            files_scanned=len(fs),
+            files_by_profile=dict(collections.Counter(p for p, _ in fs)),
+            lines_read=sum(v.in_range_lines + v.undated_lines for v in fs.values()),
+            assistant_lines=sum(
+                v.assistant_in_range + v.assistant_undated for v in fs.values()
+            ),
+            drift=dict(sorted(drift.items())),
+            skipped=dict(sorted(skipped.items())),
+            missing=dict(sorted(missing.items())),
+        )
+
+
+def scan(profiles, tz, in_range) -> Scan:
     s = Scan()
     for prof, root, _ in profiles:
         proj = root / "projects"
         if not proj.is_dir():
             continue
         for f in sorted(proj.glob("**/*.jsonl")):
-            s.files[prof] += 1
-            scan_file(s, prof, f, tz)
+            s.files_found[prof] += 1
+            try:
+                if not f.is_file():
+                    raise OSError("not a regular file")
+                scan_file(s, prof, f, tz, in_range)
+            except OSError:
+                s.unreadable += 1
     return s
 
 
-def scan_file(s: Scan, prof: str, f: Path, tz) -> None:
+def tool_blocks(content):
+    return (
+        [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if isinstance(content, list)
+        else []
+    )
+
+
+def scan_file(s: Scan, prof: str, f: Path, tz, in_range) -> None:
+    st = s.file_stats.setdefault((prof, str(f)), FileStats())
     in_sub_dir = f.parent.name == "subagents"
     meta = {}
     if in_sub_dir:
         m = f.with_name(f.stem + ".meta.json")
-        if m.is_file():
-            try:
-                meta = json.loads(m.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                s.missing["subagent meta.json unreadable"] += 1
-        else:
-            s.missing["subagent meta.json"] += 1
+        try:
+            meta = json.loads(m.read_text(encoding="utf-8")) if m.is_file() else None
+        except (OSError, ValueError):
+            meta = {}
+            st.missing["subagent meta.json unreadable"] += 1
+        if meta is None:
+            st.missing["subagent meta.json"] += 1
         if not isinstance(meta, dict):
             meta = {}
     parent_session = f.parent.parent.name if in_sub_dir else None
     run_id = f.stem if in_sub_dir else None
-    agent_type = str(meta.get("agentType") or "unknown") if in_sub_dir else None
-    reviewer_text = None
+    agent_type = (
+        meta.get("agentType") if isinstance(meta.get("agentType"), str) else None
+    )
+    if in_sub_dir:
+        agent_type = agent_type or "unknown"
+        if agent_type in ("builder", "reviewer"):
+            s.run_task[run_id] = task_tokens(meta.get("description"))
+    final_text = handback = None
     with f.open(encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
-            s.lines += 1
             line = line.strip()
             if not line:
-                s.skipped["blank line"] += 1
+                st.undated_lines += 1
+                st.skipped["blank line"] += 1
                 continue
             try:
                 d = json.loads(line)
             except ValueError:
-                s.skipped["bad json"] += 1
+                st.undated_lines += 1
+                st.skipped["bad json"] += 1
                 continue
             if not isinstance(d, dict):
-                s.skipped["not a json object"] += 1
+                st.undated_lines += 1
+                st.skipped["not a json object"] += 1
                 continue
             t = d.get("type")
-            tstamp = d.get("timestamp")
-            sess = parent_session or d.get("sessionId") or d.get("session_id") or f.stem
-            sub = in_sub_dir or bool(d.get("isSidechain"))
+            ts = parse_ts(d.get("timestamp"), tz)
+            inr = ts is not None and in_range(ts.date())
+            if ts is None:
+                st.undated_lines += 1
+            elif inr:
+                st.in_range_lines += 1
+            else:
+                st.out_of_range_lines += 1
+            sid = d.get("sessionId") if isinstance(d.get("sessionId"), str) else None
+            sess = parent_session or sid or f.stem
+            sub = in_sub_dir or d.get("isSidechain") is True
             stream = (
                 (prof, "sub", run_id)
                 if in_sub_dir
                 else ((prof, "side", sess) if sub else (prof, "main", sess))
             )
+            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+            content = msg.get("content")
             if t == "system" and d.get("subtype") == "compact_boundary":
                 cm = (
                     d.get("compactMetadata")
                     if isinstance(d.get("compactMetadata"), dict)
                     else {}
                 )
-                key = d.get("uuid") or f"{f}:{lineno}"
+                key = (
+                    d.get("uuid") if isinstance(d.get("uuid"), str) else f"{f}:{lineno}"
+                )
                 s.compacts.setdefault(
                     key,
                     dict(
                         profile=prof,
                         session=sess,
                         run=run_id,
-                        ts=parse_ts(tstamp, tz),
+                        ts=ts,
                         trigger=cm.get("trigger")
-                        if isinstance(cm.get("trigger"), str)
+                        if cm.get("trigger") in ("auto", "manual")
                         else "unknown",
                         pre_tokens=cm.get("preTokens")
-                        if isinstance(cm.get("preTokens"), int)
+                        if is_count(cm.get("preTokens"))
                         else None,
                         post_tokens=cm.get("postTokens")
-                        if isinstance(cm.get("postTokens"), int)
+                        if is_count(cm.get("postTokens"))
                         else None,
                     ),
                 )
                 continue
-            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
-            content = msg.get("content")
             if t == "user":
                 if isinstance(content, list):
                     for b in content:
                         if isinstance(b, dict) and b.get("type") == "tool_result":
                             tid = b.get("tool_use_id")
-                            if tid and tid not in s.tool_results:
+                            if not isinstance(tid, str):
+                                if inr:
+                                    st.skipped[
+                                        "tool_result with a bad tool_use_id"
+                                    ] += 1
+                                continue
+                            if tid not in s.tool_results:
                                 s.tool_results[tid] = dict(
                                     chars=content_chars(b.get("content")),
-                                    ts=parse_ts(tstamp, tz),
+                                    ts=ts,
                                     stream=stream,
                                     sub=sub,
                                 )
                 continue
             if t != "assistant":
                 continue
-            ts = parse_ts(tstamp, tz)
-            if isinstance(content, list):
-                for b in content:
-                    if (
-                        isinstance(b, dict)
-                        and b.get("type") == "tool_use"
-                        and b.get("id") not in s.tool_uses
-                    ):
-                        inp = b.get("input") if isinstance(b.get("input"), dict) else {}
-                        fp = (
-                            inp.get("file_path")
-                            if isinstance(inp.get("file_path"), str)
-                            else None
-                        )
-                        s.tool_uses[b.get("id")] = dict(
-                            name=str(b.get("name") or "unknown"),
-                            file_path=fp,
-                            ts=ts,
-                            stream=stream,
-                            session=sess,
-                            sub=sub,
-                        )
             model = msg.get("model")
             if agent_type == "reviewer":
-                txt = last_text(content)
+                txt = text_of(content)
                 if txt.strip():
-                    reviewer_text = txt
+                    final_text = txt
+                for b in tool_blocks(content):
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    if b.get("name") == HANDBACK_TOOL and isinstance(
+                        inp.get("message"), str
+                    ):
+                        handback = inp["message"]
             if model == "<synthetic>":
-                s.skipped["<synthetic> model"] += 1
+                if inr or ts is None:
+                    st.skipped["<synthetic> model"] += 1
                 if d.get("error") == "rate_limit":
-                    key = d.get("uuid") or f"{f}:{lineno}"
+                    key = (
+                        d.get("uuid")
+                        if isinstance(d.get("uuid"), str)
+                        else f"{f}:{lineno}"
+                    )
                     s.limits.setdefault(
                         key, dict(profile=prof, session=sess, run=run_id, ts=ts)
                     )
                 continue
-            s.assistant_lines += 1
-            u = msg.get("usage")
-            if not isinstance(u, dict):
-                s.drift["message.usage"] += 1
-                s.skipped["assistant line without message.usage"] += 1
-                continue
             if ts is None:
-                s.drift["timestamp"] += 1
-                s.skipped["assistant line without a valid timestamp"] += 1
+                st.assistant_undated += 1
+                st.drift["timestamp"] += 1
+                st.skipped["assistant line without a valid timestamp"] += 1
                 continue
+            if inr:
+                st.assistant_in_range += 1
+            reason = line_drift(msg, d)
+            if reason:
+                if inr:
+                    st.drift[reason] += 1
+                    st.skipped[f"assistant line: {reason}"] += 1
+                continue
+            for b in tool_blocks(content):
+                if b["id"] not in s.tool_uses:
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    fp = (
+                        inp.get("file_path")
+                        if isinstance(inp.get("file_path"), str)
+                        else None
+                    )
+                    name = (
+                        b.get("name") if isinstance(b.get("name"), str) else "unknown"
+                    )
+                    s.tool_uses[b["id"]] = dict(
+                        name=name,
+                        file_path=fp,
+                        ts=ts,
+                        stream=stream,
+                        session=sess,
+                        sub=sub,
+                    )
+            u = msg["usage"]
             key = msg.get("id") or d.get("requestId")
             if not key:
-                s.missing["message.id and requestId"] += 1
+                if inr:
+                    st.missing["message.id and requestId"] += 1
                 key = f"{f}:{lineno}"
             eff = d.get("perTurnEffort") or d.get("effort") or "unknown"
-            if eff == "unknown":
-                s.missing["effort"] += 1
-            if not model:
-                s.missing["message.model"] += 1
+            eff = eff if isinstance(eff, str) else "unknown"
+            if not isinstance(model, str) or not model:
+                if inr:
+                    st.missing["message.model"] += 1
                 model = "unknown"
             cc = (
                 u.get("cache_creation")
@@ -558,8 +750,11 @@ def scan_file(s: Scan, prof: str, f: Path, tz) -> None:
             w5 = cc.get("ephemeral_5m_input_tokens")
             w1 = cc.get("ephemeral_1h_input_tokens")
             if w5 is None and w1 is None:
-                s.missing["cache_creation 5m/1h split (counted as 5m)"] += 1
+                if inr:
+                    st.missing["cache_creation 5m/1h split (counted as 5m)"] += 1
                 w5, w1 = u.get("cache_creation_input_tokens") or 0, 0
+            if eff == "unknown" and inr:
+                st.missing["effort"] += 1
             details = (
                 u.get("output_tokens_details")
                 if isinstance(u.get("output_tokens_details"), dict)
@@ -573,24 +768,65 @@ def scan_file(s: Scan, prof: str, f: Path, tz) -> None:
                 session=str(sess),
                 stream=stream,
                 ts=ts,
-                model=str(model),
-                effort=str(eff),
-                inp=int(u.get("input_tokens") or 0),
-                w5=int(w5 or 0),
-                w1=int(w1 or 0),
-                read=int(u.get("cache_read_input_tokens") or 0),
-                out=int(u.get("output_tokens") or 0),
-                think=int(details.get("thinking_tokens") or 0),
+                model=model,
+                effort=eff,
+                inp=u.get("input_tokens") or 0,
+                w5=w5 or 0,
+                w1=w1 or 0,
+                read=u.get("cache_read_input_tokens") or 0,
+                out=u.get("output_tokens") or 0,
+                think=details.get("thinking_tokens") or 0,
                 key=key,
+                src=str(f),
+                line=lineno,
             )
             if not sub and isinstance(d.get("cwd"), str):
                 s.cwds[(prof, d["cwd"], rec["session"])] += 1
             s.raw.append(rec)
             old = s.calls.get(key)
-            if old is None or rec["out"] >= old["out"]:
+            if old is None or better(rec, old):
                 s.calls[key] = rec
     if agent_type == "reviewer":
-        s.reviewer_final[run_id] = verdict_of(reviewer_text or "")
+        s.reviewer_final[run_id] = verdict_of(handback, final_text)
+
+
+USAGE_INT_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+)
+
+
+def line_drift(msg: dict, d: dict) -> str | None:
+    """Return why an assistant line can not be used, or None."""
+    u = msg.get("usage")
+    if not isinstance(u, dict):
+        return "message.usage missing"
+    for k in USAGE_INT_FIELDS:
+        if u.get(k) is not None and not is_count(u[k]):
+            return f"usage.{k} not a non-negative integer"
+    cc = u.get("cache_creation")
+    if cc is not None:
+        if not isinstance(cc, dict):
+            return "usage.cache_creation not an object"
+        for k in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+            if cc.get(k) is not None and not is_count(cc[k]):
+                return f"usage.cache_creation.{k} not a non-negative integer"
+    det = u.get("output_tokens_details")
+    if (
+        isinstance(det, dict)
+        and det.get("thinking_tokens") is not None
+        and not is_count(det["thinking_tokens"])
+    ):
+        return "usage.thinking_tokens not a non-negative integer"
+    for k, v in (("message.id", msg.get("id")), ("requestId", d.get("requestId"))):
+        if v is not None and not isinstance(v, str):
+            return f"{k} not a string"
+    for b in tool_blocks(msg.get("content")):
+        if not isinstance(b.get("id"), str) or not b["id"]:
+            return "tool_use id not a string"
+    return None
 
 
 # ------------------------------------------------------------------- weeks
@@ -606,7 +842,8 @@ def partial_weeks(
     out = {}
     last_complete = min(end_bound, today - dt.timedelta(days=1))
     for w in weeks:
-        monday = dt.date.fromisocalendar(int(w[:4]), int(w[6:]), 1)
+        year, num = w.split("-W")
+        monday = dt.date.fromisocalendar(int(year), int(num), 1)
         sunday = monday + dt.timedelta(days=6)
         reasons = []
         if monday < start_bound:
@@ -636,8 +873,8 @@ def agg(rs, prices: Prices) -> dict:
     if any(w is None for w in ws):
         a["cw_in"] = a["cw_out"] = None
     else:
-        a["cw_in"] = sum((w[0] for w in ws), Decimal(0))
-        a["cw_out"] = sum((w[1] for w in ws), Decimal(0))
+        a["cw_in"] = sum((w[0] for w in ws), ZERO)
+        a["cw_out"] = sum((w[1] for w in ws), ZERO)
     return a
 
 
@@ -698,7 +935,7 @@ def reconciliation(scan_: Scan, recs, in_range) -> dict:
     dedup_sums = {k: sum(r[k] for r in recs) for k in TOKEN_FIELDS}
     return dict(
         method="raw = every usage line in range, no dedup; dedup = one line per message.id/requestId "
-        "(largest output_tokens kept)",
+        "(largest output_tokens kept; ties: non-fork agent, earliest time, path)",
         raw_lines=len(raw),
         dedup_calls=len(recs),
         duplicate_lines=len(raw) - len(recs),
@@ -725,7 +962,7 @@ def check_invariants(recon, blocks, total, recs, profile_names) -> dict:
             cws = [a["cw_in"] for a in b[rows_name]]
             if (
                 b["subtotal"]["cw_in"] is not None
-                and sum(cws, Decimal(0)) != b["subtotal"]["cw_in"]
+                and sum(cws, ZERO) != b["subtotal"]["cw_in"]
             ):
                 errs.append(f"{b['week']} {rows_name} cost_weighted_input")
     for k in keys:
@@ -764,12 +1001,20 @@ def assumed_window(rs) -> int:
     )
 
 
-def rewrites(streams) -> dict:
+def rewrites(streams, prices: Prices) -> dict:
     """Calls after an idle gap that re-wrote most of the context to the cache."""
     out = {}
     for kind in ("main", "sub"):
         buckets = {
-            b: dict(events=0, tokens=0, w5=0, w1=0, streams=collections.Counter())
+            b: dict(
+                events=0,
+                tokens=0,
+                w5=0,
+                w1=0,
+                cost=ZERO,
+                unpriced=0,
+                streams=collections.Counter(),
+            )
             for b in ("<5m", "5m-1h", ">1h")
         }
         for key, rs in streams.items():
@@ -796,6 +1041,11 @@ def rewrites(streams) -> dict:
                 x["tokens"] += written
                 x["w5"] += b["w5"]
                 x["w1"] += b["w1"]
+                cost = prices.cache_write_cost(b["model"], b["w5"], b["w1"])
+                if cost is None:
+                    x["unpriced"] += 1
+                else:
+                    x["cost"] += cost
                 x["streams"][key[2]] += written
         out[kind] = {
             b: dict(
@@ -803,6 +1053,8 @@ def rewrites(streams) -> dict:
                 tokens=x["tokens"],
                 cache_write_5m=x["w5"],
                 cache_write_1h=x["w1"],
+                cost_weight_usd=x["cost"],
+                unpriced_events=x["unpriced"],
                 top_ids=[
                     k
                     for k, _ in sorted(
@@ -815,11 +1067,87 @@ def rewrites(streams) -> dict:
     return out
 
 
-def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
+def link_tasks(runs, scan_: Scan) -> list[dict]:
+    """Group builder/reviewer runs of each session into tasks.
+
+    Runs are taken in start-time order. A run joins the task whose description tokens
+    overlap its own by at least TASK_LINK_MIN_OVERLAP (the best, then the most recent).
+    If none does, a reviewer joins the most recent task (by time) and a builder that
+    follows a CHANGES verdict joins that task (by time); otherwise a builder starts a new
+    task and a reviewer starts an unlinked one. Rounds = reviewer runs in the task.
+    """
+    by_session = collections.defaultdict(list)
+    for x in runs:
+        if x["agent"] in ("builder", "reviewer"):
+            by_session[x["session"]].append(x)
+    tasks = []
+    for sess in sorted(by_session):
+        st: list[dict] = []
+        for x in sorted(by_session[sess], key=lambda r: (r["start"], r["run"])):
+            toks = scan_.run_task.get(x["run"], frozenset())
+            cands = [(overlap(toks, t["tokens"]), i) for i, t in enumerate(st)]
+            cands = [c for c in cands if c[0] >= TASK_LINK_MIN_OVERLAP]
+            method = "description"
+            if cands:
+                task = st[max(cands)[1]]
+            elif st and (
+                x["agent"] == "reviewer" or st[-1]["last_verdict"] == "changes"
+            ):
+                task, method = st[-1], "time"
+            else:
+                task = dict(
+                    session=sess,
+                    index=len(st),
+                    tokens=frozenset(),
+                    runs=[],
+                    last_verdict=None,
+                )
+                st.append(task)
+                method = "new" if x["agent"] == "builder" else "unlinked"
+            if method != "time":  # a run linked only by time does not define the task
+                task["tokens"] = task["tokens"] | toks
+            task["runs"].append((x, method))
+            if x["agent"] == "reviewer":
+                task["last_verdict"] = x["verdict"]
+        tasks.extend(st)
+    out = []
+    for t in tasks:
+        runs_ = [x for x, _ in t["runs"]]
+        builders = [x for x in runs_ if x["agent"] == "builder"]
+        reviewers = [x for x in runs_ if x["agent"] == "reviewer"]
+        methods = collections.Counter(m for _, m in t["runs"])
+        out.append(
+            dict(
+                session=t["session"],
+                task=t["index"],
+                rounds=len(reviewers),
+                builder_runs=len(builders),
+                reviewer_runs=len(reviewers),
+                builder_tokens=sum(x["total_tokens"] for x in builders),
+                reviewer_tokens=sum(x["total_tokens"] for x in reviewers),
+                run_ids=[x["run"] for x in runs_],
+                linked_by=dict(sorted(methods.items())),
+                all_linked=methods.get("time", 0) == 0
+                and methods.get("unlinked", 0) == 0,
+                verdicts=dict(collections.Counter(x["verdict"] for x in reviewers)),
+                extra_runs=[
+                    x["run"]
+                    for x in builders[REVIEWER_ROUNDS_THRESHOLD:]
+                    + reviewers[REVIEWER_ROUNDS_THRESHOLD:]
+                ],
+            )
+        )
+    return out
+
+
+def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> tuple[dict, dict]:
+    """Returns (diagnostics, internal) - internal holds values used by findings only."""
     D: dict = {}
+    aux: dict = {}
     streams = stream_groups(recs)
     main = {k: rs for k, rs in streams.items() if k[1] == "main"}
     subs = {k: rs for k, rs in streams.items() if k[1] == "sub"}
+    aux["stream_model"] = {k[2]: rs[0]["model"] for k, rs in streams.items()}
 
     sessions = []
     for (prof, _, sess), rs in main.items():
@@ -905,6 +1233,7 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
         for k, v in scan_.tool_results.items()
         if v["ts"] and in_range(v["ts"].date())
     }
+    aux["results"] = results
     by_tool = collections.defaultdict(lambda: dict(count=0, total_chars=0, max_chars=0))
     top = []
     for tid, tr in results.items():
@@ -914,7 +1243,14 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
         b["total_chars"] += tr["chars"]
         b["max_chars"] = max(b["max_chars"], tr["chars"])
         top.append(
-            (tr["chars"], name, "sub" if tr["sub"] else "main", tr["ts"].date(), tid)
+            (
+                tr["chars"],
+                name,
+                "sub" if tr["sub"] else "main",
+                tr["ts"].date(),
+                tid,
+                tr["stream"][2],
+            )
         )
     D["tool_results_by_tool"] = sorted(
         (
@@ -926,9 +1262,10 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
     top.sort(key=lambda x: (-x[0], x[4]))
     D["largest_tool_results"] = [
         dict(chars=c, tool=n, where=w, date=d, tool_use_id=t)
-        for c, n, w, d, t in top[:TOP_N]
+        for c, n, w, d, t, _ in top[:TOP_N]
     ]
     large = [x for x in top if x[0] > LARGE_TOOL_RESULT_CHARS]
+    aux["large"] = large
     D["large_tool_results"] = dict(
         threshold_chars=LARGE_TOOL_RESULT_CHARS,
         count=len(large),
@@ -964,6 +1301,7 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
     rep.sort(
         key=lambda x: (-x["reads"], -x["extra_chars"], x["stream"], x["file_path"])
     )
+    aux["repeated"] = rep
     D["repeated_reads"] = dict(
         min_reads=REPEATED_READ_MIN,
         pairs=len(rep),
@@ -979,30 +1317,36 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
             k = (u["stream"][0], u["session"], u["file_path"])
             parent_first[k] = min(parent_first.get(k, u["ts"]), u["ts"])
     sub_start = {k[2]: rs[0]["ts"] for k, rs in subs.items()}
-    sub_reads = overlap = overlap_chars = 0
+    sub_reads = overlap_n = overlap_chars = 0
+    aux["reread_by_stream"] = collections.Counter()
     for tid, u in uses.items():
         if u["name"] == "Read" and u["file_path"] and u["stream"][1] == "sub":
             sub_reads += 1
             pt = parent_first.get((u["stream"][0], u["session"], u["file_path"]))
             st = sub_start.get(u["stream"][2])
             if pt and st and pt < st:
-                overlap += 1
-                overlap_chars += results.get(tid, {}).get("chars", 0)
+                overlap_n += 1
+                c = results.get(tid, {}).get("chars", 0)
+                overlap_chars += c
+                aux["reread_by_stream"][u["stream"][2]] += c
     D["subagent_rereads"] = dict(
         subagent_reads=sub_reads,
-        already_read_by_parent=overlap,
+        already_read_by_parent=overlap_n,
         already_read_chars=overlap_chars,
     )
 
     D["cache_rewrites"] = dict(
         rule=f"call after the gap writes > {REWRITE_MIN_WRITE_SHARE} of a context > {REWRITE_MIN_CONTEXT}",
-        **rewrites(streams),
+        **rewrites(streams, prices),
     )
 
-    # subagent runs, rounds, verdicts
+    # subagent runs, tasks, verdicts
     runs = []
+    aux["run_cost"] = {}
     for (prof, _, run), rs in subs.items():
         a = agg(rs, prices)
+        cw = None if a["cw_in"] is None else a["cw_in"] + a["cw_out"]
+        aux["run_cost"][run] = cw
         runs.append(
             dict(
                 run=run,
@@ -1018,9 +1362,7 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
                 output=a["out"],
                 total_tokens=a["inp"] + a["w5"] + a["w1"] + a["read"] + a["out"],
                 peak_context=max(ctx(r) for r in rs),
-                cost_weighted_usd=None
-                if a["cw_in"] is None
-                else q(a["cw_in"] + a["cw_out"]),
+                cost_weighted_usd=q(cw),
                 minutes=q(
                     Decimal(int((rs[-1]["ts"] - rs[0]["ts"]).total_seconds())) / 60,
                     TENTH,
@@ -1047,31 +1389,23 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
     D["top_subagent_runs"] = sorted(runs, key=lambda x: (-x["total_tokens"], x["run"]))[
         :TOP_N
     ]
-    rounds = collections.defaultdict(
-        lambda: dict(
-            builder_runs=0,
-            reviewer_runs=0,
-            builder_tokens=0,
-            reviewer_tokens=0,
-            approve=0,
-            changes=0,
-            unclear=0,
-        )
-    )
-    for x in runs:
-        if x["agent"] in ("builder", "reviewer"):
-            r = rounds[x["session"]]
-            r[f"{x['agent']}_runs"] += 1
-            r[f"{x['agent']}_tokens"] += x["total_tokens"]
-            if x["verdict"]:
-                r[x["verdict"]] += 1
-    br = [dict(session=k, **v) for k, v in sorted(rounds.items())]
+    tasks = link_tasks(runs, scan_)
     reviewer_runs = [x for x in runs if x["agent"] == "reviewer"]
     D["builder_reviewer"] = dict(
-        sessions=br,
-        sessions_with_rounds=len(br),
-        median_reviewer_rounds=median_int(
-            x["reviewer_runs"] for x in br if x["reviewer_runs"]
+        rule="runs grouped into tasks by description tokens (Build/Validate/Review/round words removed), "
+        "else by time order; rounds = reviewer runs per task",
+        tasks=tasks,
+        tasks_total=len(tasks),
+        tasks_by_rounds=dict(
+            sorted(collections.Counter(str(t["rounds"]) for t in tasks).items())
+        ),
+        runs_linked_by=dict(
+            sorted(
+                sum(
+                    (collections.Counter(t["linked_by"]) for t in tasks),
+                    collections.Counter(),
+                ).items()
+            )
         ),
         median_tokens_per_builder_run=median_int(
             x["total_tokens"] for x in runs if x["agent"] == "builder"
@@ -1081,14 +1415,15 @@ def diagnostics(recs, scan_: Scan, in_range, prices: Prices) -> dict:
         ),
     )
     D["reviewer_verdicts"] = dict(
-        rule="exact line 'VERDICT: APPROVE' or 'VERDICT: CHANGES' in the reviewer's final text; else unclear",
+        rule="first line matching ^[*#\\s]*VERDICT:\\s*(APPROVE|PASS|CHANGES)\\b (any case) in the "
+        f"{HANDBACK_TOOL} message, else in the final text; PASS = approve; else unclear",
         **{
             k: sum(1 for x in reviewer_runs if x["verdict"] == k)
             for k in ("approve", "changes", "unclear")
         },
     )
     D["subagent_runs"] = runs
-    return D
+    return D, aux
 
 
 # ----------------------------------------------------------- before / after
@@ -1156,17 +1491,18 @@ def delta(before, after):
 
 
 def compare(metrics, before: dict, after: dict) -> dict:
-    enough = (
-        before["sessions"] >= MIN_SESSIONS_PER_SIDE
-        and after["sessions"] >= MIN_SESSIONS_PER_SIDE
+    nb, na = (
+        as_number(before.get("sessions")) or 0,
+        as_number(after.get("sessions")) or 0,
     )
+    enough = nb >= MIN_SESSIONS_PER_SIDE and na >= MIN_SESSIONS_PER_SIDE
     rows = {}
     for m in metrics:
         d, p = delta(before.get(m), after.get(m))
         rows[m] = dict(before=before.get(m), after=after.get(m), delta=d, delta_pct=p)
     return dict(
-        sessions_before=before["sessions"],
-        sessions_after=after["sessions"],
+        sessions_before=nb,
+        sessions_after=na,
         result="compared" if enough else "insufficient data",
         metrics=rows,
     )
@@ -1200,17 +1536,37 @@ def before_after(changes, recs, scan_, prices, range_end: dt.date) -> list[dict]
     return out
 
 
-def previous_run(out_root: Path, out_dir: Path, summary: dict) -> dict | None:
+def previous_run(search_root: Path, out_dir: Path, summary: dict) -> dict | None:
+    """The latest earlier run of this tool in search_root, chosen by its manifest."""
+    if not search_root.is_dir():
+        return None
     cands = []
-    for d in sorted(p for p in out_root.glob("*") if p.is_dir()):
-        if d.resolve() == out_dir.resolve():
+    try:
+        dirs = [p for p in search_root.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            if d.resolve() == out_dir.resolve() or not (d / "manifest.json").is_file():
+                continue
+            m = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        if (d / "diagnostics.json").is_file():
-            cands.append(d)
+        if not isinstance(m, dict) or m.get("tool") != TOOL:
+            continue
+        dr = m.get("date_range") if isinstance(m.get("date_range"), dict) else {}
+        cands.append(
+            (
+                str(dr.get("data_end") or ""),
+                str(m.get("generated_at") or m.get("run_date") or ""),
+                str(d),
+                d,
+            )
+        )
     if not cands:
         return None
-    prev = cands[-1]
-    res = dict(path=prev, has_manifest=(prev / "manifest.json").is_file())
+    prev = max(cands)[3]
+    res = dict(path=prev, chosen_by="manifest date_range.data_end, then generated_at")
     try:
         pd = json.loads(
             (prev / "diagnostics.json").read_text(encoding="utf-8"), parse_float=Decimal
@@ -1220,9 +1576,7 @@ def previous_run(out_root: Path, out_dir: Path, summary: dict) -> dict | None:
     ps = pd.get("summary") if isinstance(pd, dict) else None
     if not isinstance(ps, dict) or "sessions" not in ps:
         return dict(
-            res,
-            comparable=False,
-            reason="older format: diagnostics.json has no summary block",
+            res, comparable=False, reason="diagnostics.json has no summary block"
         )
     return dict(
         res,
@@ -1250,12 +1604,83 @@ def frontmatter(text: str) -> dict:
     return out
 
 
-def file_size(p: Path) -> dict:
-    n = p.stat().st_size
-    return dict(path=p, bytes=n, approx_tokens=n // CHARS_PER_TOKEN)
+class Inv:
+    def __init__(self):
+        self.errors = collections.Counter()
+
+    def size(self, p: Path, what: str) -> dict | None:
+        try:
+            n = p.stat().st_size
+        except (OSError, ValueError):
+            self.errors[f"{what}: stat failed"] += 1
+            return None
+        return dict(path=p, bytes=n, approx_tokens=n // CHARS_PER_TOKEN)
+
+    def read(self, p: Path, what: str) -> str | None:
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            self.errors[f"{what}: read failed"] += 1
+            return None
+
+    def glob(self, root: Path, pattern: str, what: str) -> list[Path]:
+        try:
+            return sorted(root.glob(pattern))
+        except (OSError, ValueError):
+            self.errors[f"{what}: list failed"] += 1
+            return []
+
+
+def settings_summary(sp: Path, st) -> dict:
+    if not isinstance(st, dict):
+        return dict(path=sp, error="unreadable or not a JSON object")
+    env = st.get("env") if isinstance(st.get("env"), dict) else {}
+    hooks = st.get("hooks") if isinstance(st.get("hooks"), dict) else {}
+    keys = {k: safe_scalar(st[k]) for k in SETTINGS_SCALAR_KEYS if k in st}
+    ms = st.get("modelSettings")
+    model_settings = None
+    if isinstance(ms, dict):
+        model_settings = {}
+        for mk, mv in sorted(ms.items()):
+            if not SAFE_SCALAR_RE.match(str(mk)):
+                continue
+            model_settings[mk] = (
+                {k: safe_scalar(mv[k]) for k in MODEL_SETTINGS_SCALAR_KEYS if k in mv}
+                if isinstance(mv, dict)
+                else None
+            )
+    style = st.get("outputStyle")
+    ep = st.get("enabledPlugins")
+    return dict(
+        path=sp,
+        keys=keys,
+        model_settings=model_settings,
+        output_style=None
+        if style is None
+        else (style if style in OUTPUT_STYLES else "custom"),
+        other_keys=sorted(
+            k
+            for k in st
+            if k not in SETTINGS_SCALAR_KEYS and SAFE_SCALAR_RE.match(str(k))
+        ),
+        env={k: safe_scalar(env[k]) for k in SETTINGS_ENV_KEYS if k in env},
+        hooks={
+            ev: len(v) if isinstance(v, list) else 1
+            for ev, v in sorted(hooks.items())
+            if SAFE_SCALAR_RE.match(ev)
+        },
+        enabled_plugins=sorted(
+            k
+            for k, v in ep.items()
+            if v is True and SAFE_SCALAR_RE.match(k.replace("@", ":"))
+        )
+        if isinstance(ep, dict)
+        else [],
+    )
 
 
 def inventory(profiles, home: Path, scan_: Scan) -> dict:
+    iv = Inv()
     inv = {"approx_tokens_rule": f"bytes / {CHARS_PER_TOKEN}", "profiles": {}}
     for name, root, _ in profiles:
         p: dict = {"path": root, "exists": root.is_dir()}
@@ -1264,60 +1689,52 @@ def inventory(profiles, home: Path, scan_: Scan) -> dict:
             continue
         sp = root / "settings.json"
         if sp.is_file():
+            txt = iv.read(sp, "settings.json")
             try:
-                st = json.loads(sp.read_text(encoding="utf-8"), parse_float=Decimal)
-            except (OSError, ValueError):
+                st = json.loads(txt, parse_float=Decimal) if txt is not None else None
+            except ValueError:
                 st = None
-            if isinstance(st, dict):
-                env = st.get("env") if isinstance(st.get("env"), dict) else {}
-                hooks = st.get("hooks") if isinstance(st.get("hooks"), dict) else {}
-                p["settings"] = dict(
-                    path=sp,
-                    keys={k: st[k] for k in SETTINGS_KEYS if k in st},
-                    env={k: env[k] for k in SETTINGS_ENV_KEYS if k in env},
-                    hooks={
-                        ev: len(v) if isinstance(v, list) else 1
-                        for ev, v in sorted(hooks.items())
-                    },
-                    enabled_plugins=sorted(
-                        k for k, v in (st.get("enabledPlugins") or {}).items() if v
-                    )
-                    if isinstance(st.get("enabledPlugins"), dict)
-                    else [],
-                )
-            else:
-                p["settings"] = dict(path=sp, error="unreadable or not a JSON object")
-        cj = (
-            home / ".claude.json"
-            if root.resolve() == (home / ".claude").resolve()
-            else root / ".claude.json"
-        )
+            p["settings"] = settings_summary(sp, st)
+        try:
+            is_default = root.resolve() == (home / ".claude").resolve()
+        except OSError:
+            is_default = False
+        cj = home / ".claude.json" if is_default else root / ".claude.json"
         if cj.is_file():
+            txt = iv.read(cj, ".claude.json")
             try:
-                cd = json.loads(cj.read_text(encoding="utf-8"))
-                servers = cd.get("mcpServers") if isinstance(cd, dict) else None
-                p["mcp_servers"] = dict(
-                    path=cj, names=sorted(servers) if isinstance(servers, dict) else []
-                )
-            except (OSError, ValueError):
-                p["mcp_servers"] = dict(path=cj, error="unreadable")
+                cd = json.loads(txt) if txt is not None else None
+            except ValueError:
+                cd = None
+            servers = cd.get("mcpServers") if isinstance(cd, dict) else None
+            p["mcp_servers"] = dict(
+                path=cj, names=sorted(servers) if isinstance(servers, dict) else []
+            )
         cm = root / "CLAUDE.md"
-        p["claude_md"] = file_size(cm) if cm.is_file() else None
-        mem = sorted((root / "projects").glob("*/memory/**/*.md"))
+        p["claude_md"] = iv.size(cm, "CLAUDE.md") if cm.is_file() else None
+        mem = [
+            x
+            for x in (
+                iv.size(m, "memory file")
+                for m in iv.glob(root / "projects", "*/memory/**/*.md", "memory")
+            )
+            if x
+        ]
         p["memory_files"] = dict(
             count=len(mem),
-            bytes=sum(m.stat().st_size for m in mem),
-            files=[file_size(m) for m in mem],
-        )
-        p["memory_files"]["approx_tokens"] = (
-            p["memory_files"]["bytes"] // CHARS_PER_TOKEN
+            bytes=sum(m["bytes"] for m in mem),
+            files=mem,
+            approx_tokens=sum(m["bytes"] for m in mem) // CHARS_PER_TOKEN,
         )
         skills = []
-        for sk in sorted((root / "skills").glob("*/SKILL.md")):
-            fm = frontmatter(sk.read_text(encoding="utf-8", errors="replace"))
+        for sk in iv.glob(root / "skills", "*/SKILL.md", "skills"):
+            size, text = iv.size(sk, "skill"), iv.read(sk, "skill")
+            if size is None or text is None:
+                continue
+            fm = frontmatter(text)
             skills.append(
                 dict(
-                    file_size(sk),
+                    size,
                     name=sk.parent.name,
                     description_bytes=len(fm.get("description", "").encode("utf-8")),
                     disable_model_invocation=fm.get("disable-model-invocation")
@@ -1326,116 +1743,144 @@ def inventory(profiles, home: Path, scan_: Scan) -> dict:
             )
         p["skills"] = skills
         agents = []
-        for ag in sorted((root / "agents").glob("*.md")):
-            fm = frontmatter(ag.read_text(encoding="utf-8", errors="replace"))
-            item = dict(file_size(ag), name=ag.stem)
+        for ag in iv.glob(root / "agents", "*.md", "agents"):
+            size, text = iv.size(ag, "agent"), iv.read(ag, "agent")
+            if size is None or text is None:
+                continue
+            fm = frontmatter(text)
+            item = dict(size, name=ag.stem)
             for k in AGENT_KEYS:
                 if k in fm:
                     v = fm[k]
-                    item[k] = (
-                        [t.strip() for t in v.strip("[]").split(",") if t.strip()]
-                        if k.endswith("ools")
-                        else v
-                    )
+                    if k.endswith("ools"):
+                        item[k] = [
+                            t.strip()
+                            for t in v.strip("[]").split(",")
+                            if SAFE_SCALAR_RE.match(t.strip())
+                        ]
+                    else:
+                        item[k] = safe_scalar(v)
             agents.append(item)
         p["agents"] = agents
         inv["profiles"][name] = p
     proj = {}
     for (prof, cwd, sess), _ in sorted(scan_.cwds.items()):
         for rel in ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"):
-            f = Path(cwd) / rel
             try:
+                f = Path(cwd) / rel
                 if f.is_file():
-                    e = proj.setdefault(str(f), dict(file_size(f), sessions=set()))
-                    e["sessions"].add(sess)
-            except OSError:
-                continue
+                    size = iv.size(f, "project CLAUDE.md")
+                    if size:
+                        e = proj.setdefault(str(f), dict(size, sessions=set()))
+                        e["sessions"].add(sess)
+            except (OSError, ValueError):
+                iv.errors["project CLAUDE.md: stat failed"] += 1
     inv["project_claude_md"] = sorted(
         (dict(v, sessions=len(v["sessions"])) for v in proj.values()),
         key=lambda x: (-x["sessions"], str(x["path"])),
     )
+    inv["skipped"] = dict(sorted(iv.errors.items()))
     return inv
 
 
 # ------------------------------------------------------------------ findings
+# rule -> (confidence, list, token formula, cost-weight formula)
+# list A = fewer tokens with no quality loss; list B = better quality.
 RULES = {
     "cache_rewrite_after_idle": (
         "measured",
-        "cache-write tokens on rewrite calls in the bucket / weeks in range",
+        "A",
+        "cache-write tokens on rewrite calls in the bucket / weeks",
+        "same tokens x input price x 5m/1h write multiplier / weeks",
     ),
     "peak_context_over_threshold": (
         "measured",
-        f"sum over main calls of max(0, context - {PEAK_CONTEXT_THRESHOLD}) "
-        "/ weeks in range",
+        "A",
+        f"sum over main calls of max(0, context - {PEAK_CONTEXT_THRESHOLD}) / weeks",
+        "same tokens x input price x cache-read multiplier / weeks",
     ),
     "start_context_size": (
         "measured",
-        f"(median first-call context - {START_CONTEXT_THRESHOLD}) x main calls "
-        "/ weeks in range",
+        "A",
+        f"(median first-call context - {START_CONTEXT_THRESHOLD}) x main calls / weeks",
+        "same tokens x input price x cache-read multiplier / weeks",
     ),
     "reviewer_rounds_over_threshold": (
         "measured",
-        f"tokens of builder+reviewer runs after round "
-        f"{REVIEWER_ROUNDS_THRESHOLD} in each session / weeks in range",
+        "A",
+        f"tokens of builder and reviewer runs after round {REVIEWER_ROUNDS_THRESHOLD} "
+        "of each task / weeks (inferred if a run was linked by time only)",
+        "cost weight (input + output) of the same runs / weeks",
     ),
     "repeated_file_reads": (
         "inferred",
+        "A",
         f"result chars of the 2nd and later reads / {CHARS_PER_TOKEN} / weeks",
+        "same tokens x input price x 5m write multiplier / weeks",
     ),
     "large_tool_results": (
         "inferred",
+        "A",
         f"sum of (chars - {LARGE_TOOL_RESULT_CHARS}) / {CHARS_PER_TOKEN} / weeks",
+        "same tokens x input price x 5m write multiplier / weeks",
     ),
     "subagent_rereads_parent_files": (
         "inferred",
+        "A",
         f"result chars / {CHARS_PER_TOKEN} / weeks",
+        "same tokens x input price x 5m write multiplier / weeks",
     ),
-    "sessions_near_context_limit": (
-        "inferred",
-        "0 (quality signal; no token estimate)",
-    ),
-    "usage_limit_hits": ("measured", "0 (quality signal; no token estimate)"),
-    "reviewer_verdict_unclear": ("measured", "0 (quality signal; no token estimate)"),
-    "auto_compactions": ("measured", "0 (quality signal; no token estimate)"),
-    "unpriced_models": (
-        "measured",
-        "0 (cost weights missing; add the model to prices.json)",
-    ),
+    "sessions_near_context_limit": ("inferred", "B", "0 (quality signal)", "0"),
+    "usage_limit_hits": ("measured", "B", "0 (quality signal)", "0"),
+    "reviewer_verdict_unclear": ("measured", "B", "0 (quality signal)", "0"),
+    "auto_compactions": ("measured", "B", "0 (quality signal)", "0"),
+    "unpriced_models": ("measured", "B", "0 (add the model to prices.json)", "0"),
 }
 
 
-def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dict]:
+def findings(
+    D, aux, recs, weeks_in_range: Decimal, unknown_models: dict, prices: Prices
+) -> list[dict]:
     out = []
 
-    def add(fid, rule, measured, threshold, evidence, tokens):
-        conf_name = RULES[rule][0]
+    def weekly(v):
+        return v / weeks_in_range
+
+    def add(fid, rule, measured, threshold, evidence, tokens, cost, confidence=None):
+        conf_name = confidence or RULES[rule][0]
         est = (
-            int(
-                (Decimal(tokens) / weeks_in_range).quantize(
-                    Decimal(1), rounding=ROUND_HALF_UP
-                )
-            )
+            int(weekly(Decimal(tokens)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
             if tokens
             else 0
         )
+        cw = q(weekly(cost)) if cost else Decimal("0.00")
         out.append(
             dict(
                 id=fid,
                 rule=rule,
+                list=RULES[rule][1],
                 measured=measured,
                 threshold=threshold,
                 evidence=evidence,
                 est_weekly_tokens=est,
-                formula=RULES[rule][1],
+                est_weekly_cost_weight=cw,
+                formula=RULES[rule][2],
+                cost_formula=RULES[rule][3],
                 confidence=conf_name,
                 confidence_value=CONFIDENCE[conf_name],
-                score=int(
-                    (est * CONFIDENCE[conf_name]).quantize(
-                        Decimal(1), rounding=ROUND_HALF_UP
-                    )
-                ),
+                score=q(cw * CONFIDENCE[conf_name]),
             )
         )
+
+    def tool_tokens_cost(stream_chars):
+        """{stream id: chars} -> (tokens, cost weight as 5m cache writes of the stream's model)."""
+        tokens = cost = ZERO
+        for sid, chars in stream_chars.items():
+            t = Decimal(chars // CHARS_PER_TOKEN)
+            tokens += t
+            c = prices.cache_write_cost(aux["stream_model"].get(sid), t, 0)
+            cost += c or ZERO
+        return int(tokens), cost
 
     for kind in ("main", "sub"):
         for bucket in ("5m-1h", ">1h"):
@@ -1446,13 +1891,26 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
                     "cache_rewrite_after_idle",
                     x["tokens"],
                     ">= 1 rewrite event",
-                    dict(events=x["events"], top_ids=x["top_ids"]),
+                    dict(
+                        events=x["events"],
+                        unpriced_events=x["unpriced_events"],
+                        top_ids=x["top_ids"],
+                    ),
                     x["tokens"],
+                    x["cost_weight_usd"],
                 )
     main_recs = [r for r in recs if not r["sub"]]
     over = [r for r in main_recs if ctx(r) > PEAK_CONTEXT_THRESHOLD]
     if over:
         sess = sorted({r["session"] for r in over})
+        cost = sum(
+            (
+                prices.cache_read_cost(r["model"], ctx(r) - PEAK_CONTEXT_THRESHOLD)
+                or ZERO
+                for r in over
+            ),
+            ZERO,
+        )
         add(
             "peak_context_over_threshold",
             "peak_context_over_threshold",
@@ -1460,9 +1918,14 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
             f"> {PEAK_CONTEXT_THRESHOLD}",
             dict(sessions=len(sess), calls=len(over), session_ids=sess[:TOP_N]),
             sum(ctx(r) - PEAK_CONTEXT_THRESHOLD for r in over),
+            cost,
         )
     med = D["start_context"]["median"]
     if med is not None and med > START_CONTEXT_THRESHOLD:
+        extra = med - START_CONTEXT_THRESHOLD
+        cost = sum(
+            (prices.cache_read_cost(r["model"], extra) or ZERO for r in main_recs), ZERO
+        )
         add(
             "start_context_size",
             "start_context_size",
@@ -1474,59 +1937,83 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
                 by_profile=D["start_context"]["by_profile"],
                 main_calls=len(main_recs),
             ),
-            (med - START_CONTEXT_THRESHOLD) * len(main_recs),
+            extra * len(main_recs),
+            cost,
         )
-    runs = D["subagent_runs"]
-    extra, heavy = 0, []
-    for s in D["builder_reviewer"]["sessions"]:
-        if s["reviewer_runs"] > REVIEWER_ROUNDS_THRESHOLD:
-            heavy.append(s["session"])
-            for agent in ("builder", "reviewer"):
-                rr = [
-                    x
-                    for x in runs
-                    if x["session"] == s["session"] and x["agent"] == agent
-                ]
-                extra += sum(x["total_tokens"] for x in rr[REVIEWER_ROUNDS_THRESHOLD:])
+    heavy = [
+        t
+        for t in D["builder_reviewer"]["tasks"]
+        if t["rounds"] > REVIEWER_ROUNDS_THRESHOLD
+    ]
     if heavy:
+        by_run = {x["run"]: x for x in D["subagent_runs"]}
+        extra_runs = [r for t in heavy for r in t["extra_runs"]]
+        tokens = sum(by_run[r]["total_tokens"] for r in extra_runs)
+        cost = sum((aux["run_cost"].get(r) or ZERO for r in extra_runs), ZERO)
+        conf = "measured" if all(t["all_linked"] for t in heavy) else "inferred"
         add(
             "reviewer_rounds_over_threshold",
             "reviewer_rounds_over_threshold",
             len(heavy),
-            f"> {REVIEWER_ROUNDS_THRESHOLD} reviewer runs per session",
-            dict(session_ids=heavy[:TOP_N]),
-            extra,
+            f"> {REVIEWER_ROUNDS_THRESHOLD} reviewer rounds per task",
+            dict(
+                tasks=[
+                    dict(
+                        session=t["session"],
+                        task=t["task"],
+                        rounds=t["rounds"],
+                        linked_by=t["linked_by"],
+                    )
+                    for t in heavy[:TOP_N]
+                ],
+                extra_run_ids=extra_runs[:TOP_N],
+            ),
+            tokens,
+            cost,
+            confidence=conf,
         )
-    rr = D["repeated_reads"]
-    if rr["pairs"]:
+    rep = aux["repeated"]
+    if rep:
+        per = collections.Counter()
+        for x in rep:
+            per[x["stream"]] += x["extra_chars"]
+        tokens, cost = tool_tokens_cost(per)
         add(
             "repeated_file_reads",
             "repeated_file_reads",
-            rr["extra_reads"],
+            D["repeated_reads"]["extra_reads"],
             f">= {REPEATED_READ_MIN} reads",
-            dict(
-                pairs=rr["pairs"], stream_ids=sorted({x["stream"] for x in rr["worst"]})
-            ),
-            rr["extra_chars"] // CHARS_PER_TOKEN,
+            dict(pairs=len(rep), stream_ids=sorted({x["stream"] for x in rep})[:TOP_N]),
+            tokens,
+            cost,
         )
-    for tool, v in D["large_tool_results"]["by_tool"].items():
+    for tool in sorted({x[1] for x in aux["large"]}):
+        per = collections.Counter()
+        for c, n, _, _, _, sid in aux["large"]:
+            if n == tool:
+                per[sid] += c - LARGE_TOOL_RESULT_CHARS
+        tokens, cost = tool_tokens_cost(per)
+        v = D["large_tool_results"]["by_tool"][tool]
         add(
             f"large_tool_results:{tool}",
             "large_tool_results",
             v["count"],
             f"> {LARGE_TOOL_RESULT_CHARS} chars",
             dict(tool=tool, count=v["count"]),
-            v["chars_over"] // CHARS_PER_TOKEN,
+            tokens,
+            cost,
         )
     sr = D["subagent_rereads"]
     if sr["already_read_by_parent"]:
+        tokens, cost = tool_tokens_cost(aux["reread_by_stream"])
         add(
             "subagent_rereads_parent_files",
             "subagent_rereads_parent_files",
             sr["already_read_by_parent"],
             ">= 1",
             dict(subagent_reads=sr["subagent_reads"]),
-            sr["already_read_chars"] // CHARS_PER_TOKEN,
+            tokens,
+            cost,
         )
     nl = D["sessions_near_context_limit"]
     if nl["count"]:
@@ -1537,6 +2024,7 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
             f">= {NEAR_LIMIT_FRACTION} x assumed window",
             dict(session_ids=nl["sessions"][:TOP_N]),
             0,
+            ZERO,
         )
     lh = D["limit_hits"]
     if lh["total"]:
@@ -1547,6 +2035,7 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
             ">= 1",
             dict(session_ids=lh["sessions"][:TOP_N]),
             0,
+            ZERO,
         )
     rv = D["reviewer_verdicts"]
     if rv["unclear"]:
@@ -1559,9 +2048,12 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
                 approve=rv["approve"],
                 changes=rv["changes"],
                 unclear=rv["unclear"],
-                run_ids=[x["run"] for x in runs if x["verdict"] == "unclear"][:TOP_N],
+                run_ids=[
+                    x["run"] for x in D["subagent_runs"] if x["verdict"] == "unclear"
+                ][:TOP_N],
             ),
             0,
+            ZERO,
         )
     auto = D["compactions"]["by_trigger"].get("auto", 0)
     if auto:
@@ -1580,6 +2072,7 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
                 )[:TOP_N]
             ),
             0,
+            ZERO,
         )
     if unknown_models:
         add(
@@ -1589,6 +2082,7 @@ def findings(D, recs, weeks_in_range: Decimal, unknown_models: dict) -> list[dic
             ">= 1",
             dict(models=unknown_models),
             0,
+            ZERO,
         )
     out.sort(key=lambda f: (-f["score"], -f["est_weekly_tokens"], f["id"]))
     return out
@@ -1612,6 +2106,8 @@ def render_report(meta, t1, t2, D, F, recon, unknown_models, partial) -> str:
         f"Data {meta['data_start']} to {meta['data_end']}; profiles: {', '.join(meta['profiles'])}.",
         f"Prices: `{meta['prices_path']}` (checked {meta['prices_checked']}); cost-weighted columns are API list "
         "prices used as weights. A cost cell is empty if the row has a model with no price.",
+        "This file is written by the script and is not changed afterwards. Recommendations go in "
+        "`recommendations.md`.",
         "",
     ]
     if partial:
@@ -1626,6 +2122,7 @@ def render_report(meta, t1, t2, D, F, recon, unknown_models, partial) -> str:
             + ", ".join(f"{m} ({n})" for m, n in sorted(unknown_models.items())),
             "",
         ]
+    br = D["builder_reviewer"]
     L += [
         "## Weekly usage by model and effort",
         "",
@@ -1668,15 +2165,17 @@ def render_report(meta, t1, t2, D, F, recon, unknown_models, partial) -> str:
         f"pairs, {D['repeated_reads']['extra_reads']} extra reads.",
         f"- Subagent reads of files the parent had already read: "
         f"{D['subagent_rereads']['already_read_by_parent']} of {D['subagent_rereads']['subagent_reads']}.",
+        f"- Builder/reviewer tasks: {br['tasks_total']}; tasks by reviewer rounds {br['tasks_by_rounds']}; "
+        f"runs linked by {br['runs_linked_by']}.",
         f"- Reviewer verdicts: approve {D['reviewer_verdicts']['approve']}, changes "
         f"{D['reviewer_verdicts']['changes']}, unclear {D['reviewer_verdicts']['unclear']}.",
         "",
         "### Cache rewrites after idle gaps",
         "",
         md_table(
-            [["stream", "gap", "events", "tokens"]]
+            [["stream", "gap", "events", "tokens", "cost weight usd"]]
             + [
-                [k, b, v["events"], v["tokens"]]
+                [k, b, v["events"], v["tokens"], q(v["cost_weight_usd"])]
                 for k in ("main", "sub")
                 for b, v in D["cache_rewrites"][k].items()
             ]
@@ -1743,15 +2242,18 @@ def render_report(meta, t1, t2, D, F, recon, unknown_models, partial) -> str:
     L += [
         "## Findings",
         "",
-        "Sorted by score = est_weekly_tokens x confidence. Details in `findings.json`.",
+        "Sorted by score = est_weekly_cost_weight x confidence. List A = fewer tokens with no quality loss; "
+        "list B = better quality. Details in `findings.json`.",
         "",
         md_table(
             [
                 [
                     "id",
+                    "list",
                     "measured",
                     "threshold",
                     "est weekly tokens",
+                    "est weekly cost weight",
                     "confidence",
                     "score",
                 ]
@@ -1759,9 +2261,11 @@ def render_report(meta, t1, t2, D, F, recon, unknown_models, partial) -> str:
             + [
                 [
                     f["id"],
+                    f["list"],
                     f["measured"],
                     f["threshold"],
                     f["est_weekly_tokens"],
+                    f["est_weekly_cost_weight"],
                     f["confidence"],
                     f["score"],
                 ]
@@ -1792,7 +2296,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--changes",
-        help="changes.json (default <out-root>/changes.json, else the bundled template)",
+        help="changes.json (default ~/Documents/claude-usage/changes.json, "
+        "else the bundled empty template)",
     )
     p.add_argument(
         "--prices", help="prices.json (default: the one next to this script)"
@@ -1817,12 +2322,8 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
     if start and end and start > end:
         raise InputError("--start is after --end")
     here = Path(__file__).resolve().parent
-    out_dir = (
-        Path(args.out).expanduser()
-        if args.out
-        else home / "Documents" / "claude-usage" / today.isoformat()
-    )
-    out_root = out_dir.parent
+    root = default_root(home)
+    out_dir = Path(args.out).expanduser() if args.out else root / today.isoformat()
     prices = Prices(
         Path(args.prices).expanduser() if args.prices else here / "prices.json"
     )
@@ -1830,34 +2331,36 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
         changes_path = Path(args.changes).expanduser()
         if not changes_path.is_file():
             raise InputError(f"--changes: file not found: {changes_path}")
-    elif (out_root / "changes.json").is_file():
-        changes_path = out_root / "changes.json"
+    elif (root / "changes.json").is_file():
+        changes_path = root / "changes.json"
     else:
         changes_path = here / "changes.json"
     changes = load_changes(changes_path)
     profiles = resolve_profiles(args.profile, home, env)
 
-    sc = scan(profiles, tz)
-    nfiles = sum(sc.files.values())
-    if nfiles == 0:
+    def in_range(d: dt.date) -> bool:
+        return (start is None or d >= start) and (end is None or d <= end)
+
+    sc = scan(profiles, tz, in_range)
+    found = sum(sc.files_found.values())
+    if found == 0:
         raise InputError(
             "no transcript files found under <profile>/projects/**/*.jsonl for profiles: "
             + ", ".join(f"{n}={p}" for n, p, _ in profiles)
         )
-    drift_n = sum(sc.drift.values())
-    if sc.assistant_lines == 0:
+    tot = sc.totals()
+    drift_n = sum(tot["drift"].values())
+    if tot["assistant_lines"] == 0:
         raise InputError(
-            "schema drift: no assistant lines found in the transcript files"
+            f"no assistant lines with a timestamp in the date range {start or 'begin'}..{end or 'end'}"
+            f" ({found} files found, {sc.unreadable} unreadable)"
         )
-    if Decimal(drift_n) > SCHEMA_DRIFT_MAX_FRACTION * sc.assistant_lines:
+    if Decimal(drift_n) > SCHEMA_DRIFT_MAX_FRACTION * tot["assistant_lines"]:
         raise InputError(
-            f"schema drift: {drift_n} of {sc.assistant_lines} assistant lines lack "
-            f"{dict(sc.drift)} (limit {SCHEMA_DRIFT_MAX_FRACTION:%}). The transcript format may "
+            f"schema drift: {drift_n} of {tot['assistant_lines']} assistant lines in range are unusable "
+            f"{tot['drift']} (limit {SCHEMA_DRIFT_MAX_FRACTION:%}). The transcript format may "
             "have changed; update usage_report.py and its tests."
         )
-
-    def in_range(d: dt.date) -> bool:
-        return (start is None or d >= start) and (end is None or d <= end)
 
     recs = sorted(
         (r for r in sc.calls.values() if in_range(r["ts"].date())),
@@ -1887,20 +2390,18 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
         recon, blocks, total, recs, [n for n, _, _ in profiles]
     )
 
-    D = diagnostics(recs, sc, in_range, prices)
+    D, aux = diagnostics(recs, sc, in_range, prices)
     range_days = (end_bound - start_bound).days + 1
     weeks_in_range = Decimal(range_days) / 7
     D["summary"] = metric_values(
         recs, sc, start_bound, end_bound + dt.timedelta(days=1), prices
     )
     D["before_after"] = before_after(changes, recs, sc, prices, end_bound)
-    D["previous_run"] = (
-        previous_run(out_root, out_dir, D["summary"]) if out_root.is_dir() else None
-    )
+    D["previous_run"] = previous_run(out_dir.parent, out_dir, D["summary"])
     D["date_range"] = [data_start, data_end]
     D["partial_weeks"] = partial
     D["thresholds"] = {k: globals()[k] for k in THRESHOLD_NAMES}
-    F = findings(D, recs, weeks_in_range, unknown_models)
+    F = findings(D, aux, recs, weeks_in_range, unknown_models, prices)
     inv = inventory(profiles, home, sc)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1921,8 +2422,10 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
             dict(
                 weeks_in_range=q(weeks_in_range),
                 confidence=CONFIDENCE,
+                lists=dict(A="fewer tokens with no quality loss", B="better quality"),
                 rules={
-                    k: dict(confidence=v[0], formula=v[1]) for k, v in RULES.items()
+                    k: dict(confidence=v[0], list=v[1], formula=v[2], cost_formula=v[3])
+                    for k, v in RULES.items()
                 },
                 findings=F,
             )
@@ -1934,6 +2437,7 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
     manifest = dict(
         tool=TOOL,
         version=VERSION,
+        generated_at=today,
         run_date=today,
         args=dict(
             start=args.start,
@@ -1951,21 +2455,28 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
             weeks=weeks,
             partial_weeks=partial,
         ),
+        counts_rule="files, lines, skipped lines, missing fields and drift count only files that have at least "
+        "one line with a timestamp in the range, and only in-range or undated lines of those files",
         profiles=[
             dict(
-                name=n, path=p, explicit=e, exists=p.is_dir(), files=sc.files.get(n, 0)
+                name=n,
+                path=p,
+                explicit=e,
+                exists=p.is_dir(),
+                files=tot["files_by_profile"].get(n, 0),
             )
             for n, p, e in profiles
         ],
-        files_scanned=nfiles,
-        lines_read=sc.lines,
-        assistant_lines=sc.assistant_lines,
-        lines_skipped=dict(sorted(sc.skipped.items())),
-        missing_fields=dict(sorted(sc.missing.items())),
+        files_scanned=tot["files_scanned"],
+        lines_read=tot["lines_read"],
+        assistant_lines=tot["assistant_lines"],
+        lines_skipped=tot["skipped"],
+        missing_fields=tot["missing"],
         schema_drift=dict(
             lines=drift_n,
-            by_field=dict(sc.drift),
+            by_reason=tot["drift"],
             limit_fraction=SCHEMA_DRIFT_MAX_FRACTION,
+            fraction=q(Decimal(drift_n) / tot["assistant_lines"], Decimal("0.0001")),
         ),
         unknown_models=unknown_models,
         prices=dict(path=prices.path, checked=prices.checked, source=prices.source),
@@ -1990,15 +2501,15 @@ def run(argv, home: Path, env: dict, today: dt.date, tz) -> int:
         (out_dir / "manifest.json").unlink()
         raise InvariantError(
             "reconciliation_in_manifest: manifest.json is missing the reconciliation or a hash "
-            "does not match"
+            "does not match; manifest.json was deleted"
         )
     check["invariants"]["reconciliation_in_manifest"] = "pass"
     write_text(out_dir / "manifest.json", dumps(check))
-    print(
-        f"OK: {len(recs)} calls, {nfiles} files, {data_start}..{data_end} -> {out_dir}"
-    )
     if unknown_models:
         print(f"Unpriced models (no cost weight): {', '.join(unknown_models)}")
+    print(
+        f"OK: {len(recs)} calls, {tot['files_scanned']} files, {data_start}..{data_end} -> {out_dir}"
+    )
     return EXIT_OK
 
 

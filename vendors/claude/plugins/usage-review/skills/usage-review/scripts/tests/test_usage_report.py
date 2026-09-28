@@ -186,12 +186,25 @@ class FixtureRun(Base):
         )
 
     def test_verdict_parser(self):
-        self.assertEqual(ur.verdict_of("x\nVERDICT: APPROVE"), "approve")
-        self.assertEqual(ur.verdict_of("VERDICT: CHANGES\n"), "changes")
-        self.assertEqual(ur.verdict_of("VERDICT: APPROVE\nVERDICT: CHANGES"), "unclear")
-        self.assertEqual(ur.verdict_of("**VERDICT: APPROVE**"), "unclear")
-        self.assertEqual(ur.verdict_of("verdict: approve"), "unclear")
-        self.assertEqual(ur.verdict_of("Approved. LGTM."), "unclear")
+        v = ur.verdict_of
+        self.assertEqual(v(None, "x\nVERDICT: APPROVE"), "approve")
+        self.assertEqual(v(None, "VERDICT: CHANGES\n"), "changes")
+        # the first matching line wins
+        self.assertEqual(v(None, "VERDICT: APPROVE\nVERDICT: CHANGES"), "approve")
+        self.assertEqual(v(None, "VERDICT: APPROVE. All six checks pass"), "approve")
+        self.assertEqual(v(None, "VERDICT: CHANGES REQUESTED"), "changes")
+        self.assertEqual(v(None, "**VERDICT: PASS**"), "approve")
+        self.assertEqual(v(None, "## verdict: changes"), "changes")
+        self.assertEqual(v(None, "Approved. LGTM."), "unclear")
+        self.assertEqual(
+            v(None, "The VERDICT: APPROVE is not at line start"), "unclear"
+        )
+        self.assertEqual(v(None, "VERDICT: APPROVED"), "unclear")  # no word boundary
+        self.assertEqual(v(None, "**Verdict: yes, with one condition.**"), "unclear")
+        # the handback message is read first, then the final text
+        self.assertEqual(v("summary\nVERDICT: CHANGES", "VERDICT: APPROVE"), "changes")
+        self.assertEqual(v("no verdict here", "VERDICT: PASS"), "approve")
+        self.assertEqual(v("", ""), "unclear")
 
     def test_diagnostics(self):
         d = self.load("diagnostics.json")
@@ -217,8 +230,10 @@ class FixtureRun(Base):
         self.assertEqual(d["compactions"]["by_trigger"], {"auto": 1})
         self.assertEqual(d["compactions"]["events"][0]["pre_tokens"], 31000)
         self.assertEqual(d["start_context"]["median"], 15258)  # median(30010, 507)
-        br = d["builder_reviewer"]["sessions"][0]
-        self.assertEqual((br["builder_runs"], br["reviewer_runs"]), (1, 3))
+        br = d["builder_reviewer"]["tasks"]
+        self.assertEqual(len(br), 1)
+        self.assertEqual((br[0]["builder_runs"], br[0]["rounds"]), (1, 3))
+        self.assertTrue(br[0]["all_linked"])
 
     def test_findings(self):
         f = self.load("findings.json")
@@ -228,10 +243,20 @@ class FixtureRun(Base):
         rr = by_id["reviewer_rounds_over_threshold"]
         # 3rd reviewer run = 2 + 21000 + 20 tokens; range 3 days = 3/7 weeks
         self.assertEqual(rr["est_weekly_tokens"], 49051)
-        self.assertEqual((rr["confidence"], rr["score"]), ("measured", 49051))
+        # cost: ((2 + 21000*1.25) * 2 + 20 * 10) / 1e6 = 0.052704; / (3/7) = 0.12298 -> 0.12
+        self.assertEqual(rr["est_weekly_cost_weight"], "0.12")
+        self.assertEqual(
+            (rr["confidence"], rr["score"], rr["list"]), ("measured", "0.12", "A")
+        )
         lt = by_id["large_tool_results:Read"]
         self.assertEqual(lt["confidence"], "inferred")
-        self.assertEqual(lt["score"], (lt["est_weekly_tokens"] + 1) // 2)
+        # 3000 chars / 4 = 750 tokens as 5m writes on opus-5: 750 * 1.25 * 5 / 1e6 / (3/7)
+        self.assertEqual(lt["est_weekly_cost_weight"], "0.01")
+        self.assertEqual(lt["score"], "0.01")  # 0.0109 x 0.5 = 0.0055 -> 0.01
+        scores = [ur.Decimal(x["score"]) for x in f["findings"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(by_id["usage_limit_hits"]["list"], "B")
+        self.assertEqual(set(f["rules"][k]["list"] for k in f["rules"]), {"A", "B"})
         for x in f["findings"]:
             for k in (
                 "id",
@@ -240,6 +265,8 @@ class FixtureRun(Base):
                 "threshold",
                 "evidence",
                 "est_weekly_tokens",
+                "est_weekly_cost_weight",
+                "list",
                 "confidence",
                 "score",
             ):
@@ -461,13 +488,21 @@ class Changes(Base):
         self.assertEqual((ba["sessions_after"], ba["result"]), (5, "insufficient data"))
 
     def test_lookup_order(self):
-        # 1) out-root/changes.json is used when --changes is absent
+        # 0) a changes.json in the parent of --out is NOT used
         self.write_changes(self.tmp / "runs" / "changes.json")
+        self.assertEqual(self.run_main(out="runs/x"), 0, self.stderr)
+        self.assertEqual(
+            Path(self.load("manifest.json", "runs/x")["changes"]["path"]),
+            SCRIPTS / "changes.json",
+        )
+        # 1) ~/Documents/claude-usage/changes.json is used when --changes is absent
+        root = self.home / "Documents" / "claude-usage"
+        self.write_changes(root / "changes.json")
         self.assertEqual(self.run_main(), 0, self.stderr)
         self.assertEqual(
-            self.load("manifest.json")["changes"]["path"],
-            str(self.tmp / "runs" / "changes.json"),
+            self.load("manifest.json")["changes"]["path"], str(root / "changes.json")
         )
+        (root / "changes.json").unlink()
         # 2) --changes wins
         p = self.tmp / "c.json"
         self.write_changes(p)
