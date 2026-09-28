@@ -6,5 +6,11 @@
   "metadata": {
     "description": "Community plugins from the Agentic Engineering WhatsApp group."
   },
-  "plugins": []
+  "plugins": [
+    {
+      "name": "usage-review",
+      "source": "./vendors/claude/plugins/usage-review",
+      "description": "Weekly Claude Code token usage by model and effort from local transcripts, with ranked recommendations to cut tokens or raise quality."
+    }
+  ]
 }
