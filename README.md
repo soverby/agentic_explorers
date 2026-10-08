@@ -203,6 +203,7 @@ A false positive can occur, for example an install doc that legitimately contain
 ## Review and merge policy
 
 - `main` is protected. Nobody can push to it directly, and a pull request is the only way to change it.
+- Signed commits are required, `main` requires PRs to contain only verified / signed commits. 
 - [CODEOWNERS](.github/CODEOWNERS) assigns every path to [@soverby](https://github.com/soverby). **Only the maintainer can merge.** Contributors do not get write access.
 - PRs are squash-merged, so only the final, scanned content of a PR goes into `main`.
 - To merge, a PR must pass all security checks, be up to date with `main`, and have all review conversations resolved.
