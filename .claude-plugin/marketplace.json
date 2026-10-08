@@ -11,6 +11,21 @@
       "name": "usage-review",
       "source": "./vendors/claude/plugins/usage-review",
       "description": "Weekly Claude Code token usage by model and effort from local transcripts, with ranked recommendations to cut tokens or raise quality."
+    },
+    {
+      "name": "agent-status",
+      "source": "./vendors/claude/plugins/agent-status",
+      "description": "Live sub-agent status: a band above the prompt with one row per active agent, an /agent-status pane, and a toast when an agent ends."
+    },
+    {
+      "name": "usage-meter",
+      "source": "./vendors/claude/plugins/usage-meter",
+      "description": "Shows your account rate-limit windows (5h, 7d, spend) as a band above the prompt or a status line, toasts at warn and critical levels, and adds /limits."
+    },
+    {
+      "name": "context-meter",
+      "source": "./vendors/claude/plugins/context-meter",
+      "description": "Context fill, last-turn tokens and session cost in the status line; a warning toast near the limit; /ctx for the breakdown."
     }
   ]
 }

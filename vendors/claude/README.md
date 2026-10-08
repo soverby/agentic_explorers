@@ -46,7 +46,12 @@ cp agents/<name>/vendors/claude.md ~/.claude/agents/<name>.md
 Copy-Item agents\<name>\vendors\claude.md "$env:USERPROFILE\.claude\agents\<name>.md"
 ```
 
-**Claude-only plugins** live in `vendors/claude/plugins/<name>/`. The first one, `usage-review`, comes in a separate PR.
+**Claude-only plugins** live in `vendors/claude/plugins/<name>/`:
+
+- `usage-review`: weekly token usage by model and effort, with recommendations.
+- `agent-status`: live sub-agent status band above the prompt, `/agent-status` pane (a mod).
+- `usage-meter`: account rate-limit windows above the prompt, `/limits` (a mod).
+- `context-meter`: context fill, last-turn tokens and cost in the status line, `/ctx` (a mod).
 
 Other Anthropic surfaces: the [Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) runs the Claude Code agent loop from Python or TypeScript. The [Claude API](https://platform.claude.com/docs/en/api/overview) gives direct model access.
 

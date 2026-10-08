@@ -1,0 +1,21 @@
+{
+  "name": "context-meter",
+  "version": "0.1.0",
+  "description": "Context fill, last-turn tokens and session cost in the status line; a warning toast near the limit; /ctx for the breakdown.",
+  "author": {
+    "name": "Sean Overby",
+    "url": "https://github.com/soverby"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "warnAt": {
+      "type": "number",
+      "title": "Warn at context percent",
+      "description": "Show a toast once when the context window fills past this percent (1 to 100).",
+      "default": 80,
+      "min": 1,
+      "max": 100
+    }
+  }
+}
