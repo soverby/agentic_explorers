@@ -1,0 +1,23 @@
+{
+  "name": "agent-status",
+  "version": "0.1.0",
+  "description": "Live sub-agent status: a band above the prompt with one row per active agent, an /agent-status pane, and a toast when an agent ends.",
+  "author": {
+    "name": "Sean Overby",
+    "url": "https://github.com/soverby"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "style": {
+      "type": "string",
+      "title": "Style",
+      "description": "plain shows a status glyph per agent; critters shows a small animated creature per running agent.",
+      "default": "plain",
+      "options": [
+        "plain",
+        "critters"
+      ]
+    }
+  }
+}

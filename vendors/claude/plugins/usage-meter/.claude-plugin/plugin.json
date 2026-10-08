@@ -1,0 +1,39 @@
+{
+  "name": "usage-meter",
+  "version": "0.1.0",
+  "description": "Shows your account rate-limit windows (5h, 7d, spend) as a band above the prompt or a status line, toasts at warn and critical levels, and adds /limits.",
+  "author": {
+    "name": "Sean Overby",
+    "url": "https://github.com/soverby"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "display": {
+      "type": "string",
+      "title": "Display",
+      "description": "Where the meter shows: a band above the prompt, or a one-line status.",
+      "options": [
+        "band",
+        "status"
+      ],
+      "default": "band"
+    },
+    "warnAt": {
+      "type": "number",
+      "title": "Warn at (%)",
+      "description": "Toast once per window per reset period when usage reaches this percent.",
+      "default": 80,
+      "min": 1,
+      "max": 100
+    },
+    "critAt": {
+      "type": "number",
+      "title": "Critical at (%)",
+      "description": "Toast once per window per reset period when usage reaches this percent.",
+      "default": 95,
+      "min": 1,
+      "max": 100
+    }
+  }
+}
